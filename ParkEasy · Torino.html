@@ -1,0 +1,2361 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="theme-color" content="#0d0d12">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+<link rel="icon" type="image/png" sizes="512x512" href="icons/icon-512.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="ParkEasy">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="msapplication-TileColor" content="#0d0d12">
+<meta name="msapplication-TileImage" content="icons/icon-144.png">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>ParkEasy · Torino</title>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<script type="module">
+import { initializeApp }           from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
+import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword,
+         signInWithPopup, GoogleAuthProvider, signOut, onAuthStateChanged,
+         updateProfile, sendPasswordResetEmail }
+  from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js';
+import { getFirestore, doc, setDoc, getDoc, updateDoc,
+         collection, addDoc, query, orderBy, limit, getDocs, serverTimestamp }
+  from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js';
+
+// ── CONFIGURAZIONE FIREBASE ───────────────────────────────────
+// ⚠️ Sostituisci con le tue credenziali da Firebase Console
+// https://console.firebase.google.com → Project Settings → Your apps → Web
+const firebaseConfig = {
+  apiKey:            "LA_TUA_API_KEY",
+  authDomain:        "tuo-progetto.firebaseapp.com",
+  projectId:         "tuo-progetto",
+  storageBucket:     "tuo-progetto.appspot.com",
+  messagingSenderId: "123456789",
+  appId:             "1:123456789:web:abcdef"
+};
+
+const app    = initializeApp(firebaseConfig);
+const auth   = getAuth(app);
+const db     = getFirestore(app);
+const googleProvider = new GoogleAuthProvider();
+
+// ── STATO GLOBALE ──────────────────────────────────────────
+window.ParkAuth = {
+  user:    null,
+  profile: null,
+  auth, db,
+
+  // Esponi funzioni globali per i pulsanti HTML
+  loginEmail:    loginEmail,
+  registerEmail: registerEmail,
+  loginGoogle:   loginGoogle,
+  logout:        logout,
+  resetPassword: resetPassword,
+  updateProfile: updateUserProfile,
+  saveVehicle:   saveVehicle,
+};
+
+// ── AUTH STATE OBSERVER ────────────────────────────────────
+onAuthStateChanged(auth, async (user) => {
+  window.ParkAuth.user = user;
+  if (user) {
+    await loadOrCreateProfile(user);
+    showScreen('profile');
+  } else {
+    showScreen('login');
+  }
+});
+
+// ── CREA / CARICA PROFILO FIRESTORE ───────────────────────
+async function loadOrCreateProfile(user) {
+  const ref  = doc(db, 'users', user.uid);
+  const snap = await getDoc(ref);
+
+  if (!snap.exists()) {
+    // Prima registrazione — crea profilo
+    const profile = {
+      uid:        user.uid,
+      email:      user.email,
+      name:       user.displayName || '',
+      avatar:     user.photoURL    || '',
+      plan:       'free',          // 'free' | 'blue' | 'black'
+      points:     0,
+      createdAt:  serverTimestamp(),
+      vehicle:    { targa:'', modello:'' },
+    };
+    await setDoc(ref, profile);
+    window.ParkAuth.profile = profile;
+  } else {
+    window.ParkAuth.profile = snap.data();
+  }
+
+  renderProfile();
+  await loadHistory(user.uid);
+}
+
+// ── LOGIN CON EMAIL ────────────────────────────────────────
+async function loginEmail() {
+  const email = document.getElementById('loginEmail').value.trim();
+  const pass  = document.getElementById('loginPass').value;
+  if (!email || !pass) { showError('login', 'Compila email e password'); return; }
+
+  setLoading('btnLogin', true);
+  try {
+    await signInWithEmailAndPassword(auth, email, pass);
+    // onAuthStateChanged gestisce il resto
+  } catch (e) {
+    setLoading('btnLogin', false);
+    showError('login', firebaseError(e.code));
+  }
+}
+
+// ── REGISTRAZIONE ─────────────────────────────────────────
+async function registerEmail() {
+  const name  = document.getElementById('regName').value.trim();
+  const email = document.getElementById('regEmail').value.trim();
+  const pass  = document.getElementById('regPass').value;
+  const pass2 = document.getElementById('regPass2').value;
+
+  if (!name || !email || !pass) { showError('reg', 'Compila tutti i campi'); return; }
+  if (pass.length < 6)          { showError('reg', 'Password minimo 6 caratteri'); return; }
+  if (pass !== pass2)           { showError('reg', 'Le password non coincidono'); return; }
+
+  setLoading('btnReg', true);
+  try {
+    const cred = await createUserWithEmailAndPassword(auth, email, pass);
+    await updateProfile(cred.user, { displayName: name });
+    // onAuthStateChanged gestisce il resto
+  } catch (e) {
+    setLoading('btnReg', false);
+    showError('reg', firebaseError(e.code));
+  }
+}
+
+// ── LOGIN GOOGLE ───────────────────────────────────────────
+async function loginGoogle() {
+  try {
+    await signInWithPopup(auth, googleProvider);
+  } catch (e) {
+    showError('login', firebaseError(e.code));
+  }
+}
+
+// ── LOGOUT ────────────────────────────────────────────────
+async function logout() {
+  await signOut(auth);
+}
+
+// ── RESET PASSWORD ────────────────────────────────────────
+async function resetPassword() {
+  const email = document.getElementById('loginEmail').value.trim();
+  if (!email) { showError('login', 'Inserisci la tua email prima'); return; }
+  try {
+    await sendPasswordResetEmail(auth, email);
+    showError('login', '✅ Email di reset inviata!', true);
+  } catch (e) {
+    showError('login', firebaseError(e.code));
+  }
+}
+
+// ── AGGIORNA PROFILO ──────────────────────────────────────
+async function updateUserProfile() {
+  const user = auth.currentUser;
+  if (!user) return;
+  const name = document.getElementById('editName').value.trim();
+  if (!name) { showToast('⚠️ Inserisci un nome'); return; }
+
+  setLoading('btnSaveProfile', true);
+  try {
+    await updateProfile(user, { displayName: name });
+    await updateDoc(doc(db, 'users', user.uid), { name });
+    window.ParkAuth.profile.name = name;
+    renderProfile();
+    closeModal('editModal');
+    showToast('✅ Profilo aggiornato');
+  } catch (e) {
+    showToast('❌ Errore: ' + e.message);
+  } finally {
+    setLoading('btnSaveProfile', false);
+  }
+}
+
+// ── SALVA VEICOLO ─────────────────────────────────────────
+async function saveVehicle() {
+  const user = auth.currentUser;
+  if (!user) return;
+  const targa   = document.getElementById('vTarga').value.trim().toUpperCase();
+  const modello = document.getElementById('vModello').value.trim();
+  if (!targa) { showToast('⚠️ Inserisci la targa'); return; }
+
+  setLoading('btnSaveVehicle', true);
+  try {
+    await updateDoc(doc(db, 'users', user.uid), { vehicle: { targa, modello } });
+    window.ParkAuth.profile.vehicle = { targa, modello };
+    renderVehicle();
+    closeModal('vehicleModal');
+    showToast('✅ Veicolo salvato');
+  } catch (e) {
+    showToast('❌ Errore: ' + e.message);
+  } finally {
+    setLoading('btnSaveVehicle', false);
+  }
+}
+
+// ── STORICO PRENOTAZIONI ──────────────────────────────────
+async function loadHistory(uid) {
+  try {
+    const q    = query(collection(db, 'users', uid, 'bookings'), orderBy('createdAt','desc'), limit(10));
+    const snap = await getDocs(q);
+    const items = snap.docs.map(d => d.data());
+    renderHistory(items);
+  } catch (e) {
+    console.warn('Storico non disponibile:', e.message);
+    renderHistory([]);
+  }
+}
+
+// ── FUNZIONE PUBBLICA: aggiungi prenotazione dallo storico ─
+window.ParkAuth.addBooking = async function(booking) {
+  const user = auth.currentUser;
+  if (!user) return;
+  try {
+    await addDoc(collection(db, 'users', user.uid, 'bookings'), {
+      ...booking,
+      createdAt: serverTimestamp(),
+    });
+    // Aggiungi punti (solo Black)
+    const prof = window.ParkAuth.profile;
+    if (prof?.plan === 'black') {
+      const newPts = (prof.points || 0) + 10;
+      await updateDoc(doc(db, 'users', user.uid), { points: newPts });
+      window.ParkAuth.profile.points = newPts;
+      renderProfile();
+      if (newPts % 500 < 10) showToast('🎉 Hai raggiunto ' + newPts + ' punti — €2 di sconto sbloccati!');
+    }
+    await loadHistory(user.uid);
+  } catch (e) {
+    console.warn('Errore salvataggio prenotazione:', e.message);
+  }
+};
+
+// ── RENDER PROFILO ────────────────────────────────────────
+function renderProfile() {
+  const p   = window.ParkAuth.profile;
+  const usr = window.ParkAuth.user;
+  if (!p || !usr) return;
+
+  const name    = p.name || usr.displayName || usr.email.split('@')[0];
+  const initials = name.split(' ').map(w=>w[0]).join('').toUpperCase().slice(0,2);
+  const planLabels = { free:'Free', blue:'Blue 💙', black:'Black ✦' };
+  const planColors = { free:'#94a3b8', blue:'#2563eb', black:'#d4af37' };
+
+  document.getElementById('profInitials').textContent = initials;
+  document.getElementById('profName').textContent     = name;
+  document.getElementById('profEmail').textContent    = usr.email;
+  document.getElementById('profPlan').textContent     = planLabels[p.plan] || 'Free';
+  document.getElementById('profPlan').style.color     = planColors[p.plan] || '#94a3b8';
+  document.getElementById('profPoints').textContent   = p.points || 0;
+
+  // Barra punti (solo black)
+  const ptsBar  = document.getElementById('ptsBarWrap');
+  const ptsFill = document.getElementById('ptsFill');
+  const ptsNext = document.getElementById('ptsNext');
+  if (p.plan === 'black') {
+    ptsBar.style.display = 'block';
+    const pts = p.points || 0;
+    const pct = Math.min(100, (pts % 500) / 5);
+    ptsFill.style.width = pct + '%';
+    const remaining = 500 - (pts % 500);
+    ptsNext.textContent = remaining + ' punti al prossimo €2 di sconto';
+  } else {
+    ptsBar.style.display = 'none';
+  }
+
+  // Avatar foto Google o iniziali
+  const avatarEl = document.getElementById('profAvatar');
+  if (usr.photoURL) {
+    avatarEl.innerHTML = `<img src="${usr.photoURL}" style="width:100%;height:100%;border-radius:50%;object-fit:cover">`;
+  } else {
+    avatarEl.textContent = initials;
+  }
+
+  renderVehicle();
+}
+
+function renderVehicle() {
+  const p = window.ParkAuth.profile;
+  const vEl = document.getElementById('vehicleInfo');
+  if (p?.vehicle?.targa) {
+    vEl.innerHTML = `
+      <div class="veh-targa">${p.vehicle.targa}</div>
+      <div class="veh-modello">${p.vehicle.modello || 'Veicolo'}</div>`;
+  } else {
+    vEl.innerHTML = `<div style="color:var(--t3);font-size:.82rem">Nessun veicolo salvato</div>`;
+  }
+}
+
+function renderHistory(items) {
+  const el = document.getElementById('historyList');
+  if (items.length === 0) {
+    el.innerHTML = `<div class="empty-state">Nessuna prenotazione ancora.<br>Inizia a usare ParkEasy! 🅿️</div>`;
+    return;
+  }
+  el.innerHTML = items.map(b => {
+    const d    = b.createdAt?.toDate ? b.createdAt.toDate() : new Date();
+    const date = d.toLocaleDateString('it-IT', { day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit' });
+    return `<div class="hist-item">
+      <div class="hist-ico">${b.type==='black'?'✦':b.type==='blue'?'💙':'🅿️'}</div>
+      <div class="hist-info">
+        <div class="hist-name">${b.parkName || '—'}</div>
+        <div class="hist-date">${date} · ${b.minuti || '—'} min prenotati</div>
+      </div>
+      <div class="hist-price">${b.price || '—'}</div>
+    </div>`;
+  }).join('');
+}
+
+// ── UTILITIES ─────────────────────────────────────────────
+function firebaseError(code) {
+  const map = {
+    'auth/user-not-found':       'Email non trovata',
+    'auth/wrong-password':       'Password errata',
+    'auth/invalid-credential':   'Credenziali non valide',
+    'auth/email-already-in-use': 'Email già registrata',
+    'auth/weak-password':        'Password troppo debole (min 6 caratteri)',
+    'auth/invalid-email':        'Email non valida',
+    'auth/too-many-requests':    'Troppi tentativi. Riprova tra qualche minuto',
+    'auth/popup-closed-by-user': 'Finestra chiusa. Riprova',
+    'auth/network-request-failed': 'Errore di rete. Controlla la connessione',
+  };
+  return map[code] || 'Errore: ' + code;
+}
+
+function setLoading(btnId, loading) {
+  const btn = document.getElementById(btnId);
+  if (!btn) return;
+  btn.disabled = loading;
+  if (loading) { btn._orig = btn.textContent; btn.textContent = '⏳ Attendi…'; }
+  else         { btn.textContent = btn._orig || btn.textContent; }
+}
+
+function showError(form, msg, isSuccess=false) {
+  const id = form === 'login' ? 'loginErr' : 'regErr';
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = msg;
+  el.style.color = isSuccess ? 'var(--green)' : 'var(--red)';
+  el.style.display = 'block';
+}
+
+window.showToast = function(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(t._t); t._t = setTimeout(() => t.classList.remove('show'), 3200);
+};
+
+window.showScreen = function(name) {
+  // sync nav avatar on screen change
+  setTimeout(syncNavAvatar, 100);
+  ['authScreen','profileScreen'].forEach(id => {
+    document.getElementById(id).style.display = 'none';
+  });
+  if (name === 'login' || name === 'register') {
+    document.getElementById('authScreen').style.display = 'flex';
+    switchAuthTab(name === 'register' ? 'reg' : 'login');
+  } else {
+    document.getElementById('profileScreen').style.display = 'flex';
+  }
+};
+
+window.switchAuthTab = function(tab) {
+  ['loginForm','regForm'].forEach(id => document.getElementById(id).style.display='none');
+  ['tabLogin','tabReg'].forEach(id => document.getElementById(id).classList.remove('active'));
+  document.getElementById(tab==='login'?'loginForm':'regForm').style.display='flex';
+  document.getElementById(tab==='login'?'tabLogin':'tabReg').classList.add('active');
+  document.getElementById('loginErr').style.display='none';
+  document.getElementById('regErr').style.display='none';
+};
+
+window.openModal = function(id) { document.getElementById(id).classList.add('open'); };
+window.closeModal = function(id) { document.getElementById(id).classList.remove('open'); };
+
+window.openEditProfile = function() {
+  const p = window.ParkAuth.profile;
+  const u = window.ParkAuth.user;
+  document.getElementById('editName').value = p?.name || u?.displayName || '';
+  openModal('editModal');
+};
+
+window.openVehicleModal = function() {
+  const p = window.ParkAuth.profile;
+  document.getElementById('vTarga').value   = p?.vehicle?.targa   || '';
+  document.getElementById('vModello').value = p?.vehicle?.modello || '';
+  openModal('vehicleModal');
+};
+
+window.logoutUser = logout;
+window.resetPassword = resetPassword;
+</script>
+<style>
+
+/* ── DARK DESIGN TOKENS ─────────────── */
+:root{
+  --green:#00c96b;--green-l:rgba(0,201,107,.12);--green-m:#00e87b;
+  --blue:#4f8ef7;--blue-l:rgba(79,142,247,.14);
+  --dis:#a78bfa;--dis-l:rgba(167,139,250,.14);
+  --crowd:#f97316;--crowd-l:rgba(249,115,22,.12);
+  --yellow:#f59e0b;--yellow-l:rgba(245,158,11,.14);
+  --red:#f43f5e;--red-l:rgba(244,63,94,.14);
+  --gd:#e8c46a;
+  --bg:#0d0d12;--wh:#13131b;
+  --tx:#f0f0fa;--t2:#7070a0;--t3:#3a3a58;
+  --bd:rgba(255,255,255,.07);--bd2:rgba(255,255,255,.13);
+  --sh:0 2px 8px rgba(0,0,0,.5);
+  --shl:0 16px 48px rgba(0,0,0,.7);
+  --r:16px
+}
+/* Keep old tokens as aliases for compatibility */
+
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+:root{
+  --green:#16a34a;--green-l:#dcfce7;--green-m:#4ade80;
+  --blue:#2563eb;--blue-l:#dbeafe;
+  --dis:#7c3aed;--dis-l:#ede9fe;
+  --crowd:#ea580c;--crowd-l:#ffedd5;
+  --yellow:#eab308;--yellow-l:#fef9c3;
+  --red:#ef4444;--red-l:#fee2e2;
+  --bg:#f8fafc;--white:#fff;
+  --text:#0f172a;--t2:#475569;--t3:#94a3b8;--border:#e2e8f0;
+  --sh:0 1px 3px rgba(0,0,0,.08),0 1px 2px rgba(0,0,0,.06);
+  --sh-lg:0 8px 32px rgba(0,0,0,.10),0 4px 12px rgba(0,0,0,.06);
+  --r:16px
+}
+html{scroll-behavior:smooth}
+::-webkit-scrollbar{display:none}
+body{font-family:'Sora',sans-serif;background:var(--bg);color:var(--tx,var(--text));min-height:100vh;overflow-x:hidden;-webkit-font-smoothing:antialiased}
+
+/* TOPBAR */
+.topbar{position:fixed;top:0;left:0;right:0;z-index:1000;display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:var(--white);border-bottom:1px solid var(--border);box-shadow:var(--sh)}
+.logo{font-size:1.2rem;font-weight:800;letter-spacing:-.5px}
+.logo em{color:var(--green);font-style:normal}
+.topbar-r{display:flex;align-items:center;gap:8px}
+.live-pill{display:flex;align-items:center;gap:5px;background:var(--green-l);color:var(--green);border-radius:20px;padding:4px 10px;font-size:.7rem;font-weight:700}
+.live-dot{width:6px;height:6px;border-radius:50%;background:var(--green);animation:blink 1.4s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+@keyframes grpulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.8)}}
+.avatar{width:32px;height:32px;border-radius:50%;background:linear-gradient(135deg,#16a34a,#4ade80);color:#fff;font-weight:700;font-size:.75rem;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center}
+
+/* OSM loading bar */
+.osm-bar{height:3px;background:var(--border);position:relative;overflow:hidden;flex-shrink:0}
+.osm-bar-fill{position:absolute;top:0;left:-100%;width:100%;height:100%;background:linear-gradient(90deg,transparent,var(--blue),transparent);animation:slide 1.2s infinite}
+@keyframes slide{to{left:100%}}
+.osm-bar.done{background:var(--green-l);transition:background .5s}
+.osm-bar.done .osm-bar-fill{display:none}
+
+/* MAP */
+.map-section{margin-top:57px;position:relative;height:55vh;min-height:280px;max-height:420px}
+#map{width:100%;height:100%}
+.map-fade{position:absolute;bottom:0;left:0;right:0;height:60px;background:linear-gradient(transparent,var(--bg));pointer-events:none;z-index:400}
+.map-search{position:absolute;top:12px;left:12px;right:12px;z-index:500;display:flex;gap:8px}
+.map-search input{flex:1;background:var(--white);border:none;border-radius:12px;padding:12px 14px;font-family:'Sora',sans-serif;font-size:.88rem;color:var(--text);box-shadow:var(--sh-lg);outline:none}
+.map-search input::placeholder{color:var(--t3)}
+.locate-btn{width:46px;height:46px;background:var(--white);border:none;border-radius:12px;box-shadow:var(--sh-lg);cursor:pointer;display:flex;align-items:center;justify-content:center;color:var(--green);flex-shrink:0;transition:all .15s}
+.locate-btn:active{transform:scale(.93)}
+/* Filter pills */
+.map-filters{position:absolute;top:68px;left:12px;right:12px;z-index:500;display:flex;gap:6px;overflow-x:auto;scrollbar-width:none}
+.map-filters::-webkit-scrollbar{display:none}
+.mf-pill{flex-shrink:0;display:flex;align-items:center;gap:5px;background:var(--white);border:2px solid var(--border);border-radius:20px;padding:5px 11px;font-size:.7rem;font-weight:700;cursor:pointer;box-shadow:var(--sh);transition:all .18s;white-space:nowrap;color:var(--t3)}
+.mf-pill.on.str{background:var(--blue-l);color:var(--blue);border-color:var(--blue)}
+.mf-pill.on.blu{background:#f0fdf4;color:var(--green);border-color:var(--green)}
+.mf-pill.on.dis{background:var(--dis-l);color:var(--dis);border-color:var(--dis)}
+.mf-pill.on.cro{background:var(--crowd-l);color:var(--crowd);border-color:var(--crowd)}
+.mf-dot{width:8px;height:8px;border-radius:50%}
+/* Stats */
+.map-stats{position:absolute;bottom:16px;left:50%;transform:translateX(-50%);z-index:500;display:flex;gap:6px;background:var(--white);border-radius:30px;padding:7px 14px;box-shadow:var(--sh-lg);white-space:nowrap}
+.ms{display:flex;align-items:center;gap:4px;font-size:.7rem;font-weight:600}
+.msdot{width:7px;height:7px;border-radius:50%}
+.mssep{width:1px;background:var(--border);align-self:stretch}
+
+/* SCROLL */
+.sc{padding:10px 16px 32px;display:flex;flex-direction:column;gap:12px}
+.slbl{font-size:.66rem;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;color:var(--t3);margin-bottom:-4px;margin-top:4px;padding-left:2px}
+
+/* CROWD BANNER */
+.crowd-banner{background:linear-gradient(135deg,#fff7ed,#ffedd5);border:1.5px solid #fed7aa;border-radius:var(--r);padding:16px;display:flex;gap:12px;align-items:flex-start;cursor:pointer;transition:all .15s}
+.crowd-banner:active{transform:scale(.98)}
+.cb-ico{font-size:1.8rem;flex-shrink:0}
+.cb-title{font-size:.95rem;font-weight:800;color:#9a3412;margin-bottom:2px}
+.cb-sub{font-size:.77rem;color:#c2410c;line-height:1.4}
+.cb-cta{margin-top:10px;background:var(--crowd);color:#fff;border:none;border-radius:10px;padding:10px 16px;font-family:'Sora',sans-serif;font-size:.85rem;font-weight:700;cursor:pointer;width:100%}
+.cb-cta:active{opacity:.9}
+
+/* NEARBY */
+.nearby{display:flex;gap:10px;overflow-x:auto;padding-bottom:4px;scrollbar-width:none}
+.nearby::-webkit-scrollbar{display:none}
+.nc{flex-shrink:0;width:162px;background:var(--white);border-radius:var(--r);padding:14px 12px 12px;box-shadow:var(--sh);border:1.5px solid var(--border);cursor:pointer;transition:all .18s;position:relative;overflow:hidden}
+.nc:active{transform:scale(.97)}
+.nc.sel{border-color:var(--green);box-shadow:0 0 0 3px rgba(22,163,74,.12)}
+.nc-bar{position:absolute;top:0;left:0;right:0;height:3px;border-radius:3px 3px 0 0}
+.nc-bar.str{background:var(--blue)}.nc-bar.blu{background:var(--green)}.nc-bar.dis{background:var(--dis)}.nc-bar.cro{background:var(--crowd)}
+.nc-name{font-size:.8rem;font-weight:700;line-height:1.2;margin-bottom:4px}
+.nc-badge{font-size:.62rem;font-weight:600;border-radius:20px;padding:2px 7px;display:inline-block;margin-bottom:6px}
+.nc-badge.str{background:var(--blue-l);color:var(--blue)}.nc-badge.blu{background:var(--green-l);color:var(--green)}.nc-badge.dis{background:var(--dis-l);color:var(--dis)}.nc-badge.cro{background:var(--crowd-l);color:var(--crowd)}
+.nc-num{font-family:'JetBrains Mono',monospace;font-size:1.3rem;font-weight:500;line-height:1}
+.nc-num.free{color:var(--green)}.nc-num.few{color:var(--yellow)}.nc-num.busy{color:var(--red)}.nc-num.nd{color:var(--t3)}
+.nc-lbl{font-size:.6rem;color:var(--t3);margin-top:2px}
+
+/* AVAIL */
+.avail-card{background:var(--white);border-radius:var(--r);box-shadow:var(--sh);border:1.5px solid var(--border);overflow:hidden}
+.av-head{display:flex;align-items:center;justify-content:space-between;padding:15px 17px 10px}
+.av-title{font-size:.93rem;font-weight:700}
+.av-ref{display:flex;align-items:center;gap:4px;font-size:.7rem;color:var(--green);font-weight:600;cursor:pointer}
+.av-rows{padding:0 17px 15px;display:flex;flex-direction:column;gap:9px}
+.av-row{display:flex;align-items:center;gap:9px;cursor:pointer;border-radius:8px;padding:4px;margin:-4px;transition:background .15s}
+.av-row:active{background:var(--bg)}
+.avdot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.av-name{font-size:.78rem;font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.av-bar{width:88px;height:6px;background:var(--border);border-radius:3px;overflow:hidden;flex-shrink:0}
+.av-fill{height:100%;border-radius:3px;transition:width .6s}
+.av-fill.free{background:var(--green)}.av-fill.few{background:var(--yellow)}.av-fill.busy{background:var(--red)}
+.av-cnt{font-family:'JetBrains Mono',monospace;font-size:.73rem;min-width:34px;text-align:right;flex-shrink:0}
+.av-cnt.free{color:var(--green)}.av-cnt.few{color:var(--yellow)}.av-cnt.busy{color:var(--red)}
+
+/* LEGEND */
+.legend-card{background:var(--white);border-radius:var(--r);box-shadow:var(--sh);border:1.5px solid var(--border);padding:16px 17px}
+.lg-title{font-size:.9rem;font-weight:700;margin-bottom:12px}
+.lg-rows{display:flex;flex-direction:column;gap:10px}
+.lg-row{display:flex;align-items:center;gap:10px}
+.lg-pin{width:28px;height:28px;border-radius:50%;border:2.5px solid #fff;box-shadow:0 1px 6px rgba(0,0,0,.18);display:flex;align-items:center;justify-content:center;font-size:.72rem;flex-shrink:0}
+.lg-name{font-size:.82rem;font-weight:700}
+.lg-desc{font-size:.7rem;color:var(--t2);margin-top:1px}
+
+/* CROWD HOW-TO */
+.crowd-steps{display:flex;flex-direction:column;gap:8px}
+.cs{display:flex;align-items:flex-start;gap:12px;background:var(--white);border:1.5px solid var(--border);border-radius:12px;padding:13px;cursor:pointer;transition:all .15s;box-shadow:var(--sh)}
+.cs:active{transform:scale(.98);background:var(--bg)}
+.cs-num{width:27px;height:27px;border-radius:50%;background:var(--crowd);color:#fff;font-size:.78rem;font-weight:800;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.cs-title{font-size:.86rem;font-weight:700;margin-bottom:2px}
+.cs-desc{font-size:.73rem;color:var(--t2);line-height:1.35}
+
+/* SEGNALAZIONI */
+.segn-list{display:flex;flex-direction:column;gap:6px}
+.segn-item{background:var(--white);border:1.5px solid #fed7aa;border-radius:10px;padding:10px 13px;display:flex;align-items:center;gap:10px}
+.segn-ico{font-size:1.1rem;flex-shrink:0}
+.segn-name{font-size:.8rem;font-weight:700}
+.segn-time{font-size:.68rem;color:var(--t3);margin-top:1px}
+.segn-cnt{font-family:'JetBrains Mono',monospace;font-size:.82rem;color:var(--crowd)}
+
+/* BOOK CARD */
+.book-card{background:linear-gradient(135deg,#0a2e1a,#0f3d22);border:1px solid rgba(0,201,107,.2);border-radius:var(--r);padding:20px;color:var(--tx);cursor:pointer;transition:all .18s;position:relative;overflow:hidden}
+.book-card::after{content:'';position:absolute;top:-30px;right:-30px;width:110px;height:110px;border-radius:50%;background:rgba(255,255,255,.08)}
+.book-card:active{transform:scale(.985)}
+.bc-top{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:10px}
+.bc-ico{font-size:2rem}.bc-badge{background:rgba(255,255,255,.2);border-radius:20px;padding:4px 10px;font-size:.68rem;font-weight:700}
+.bc-title{font-size:1.12rem;font-weight:800;margin-bottom:3px}.bc-sub{font-size:.78rem;opacity:.85;line-height:1.4}
+.bc-cta{margin-top:14px;background:#fff;color:var(--green);border:none;border-radius:10px;padding:11px;font-family:'Sora',sans-serif;font-size:.88rem;font-weight:700;width:100%;cursor:pointer}
+.bc-cta:active{opacity:.9}
+
+/* PRICES */
+.prices-card{background:var(--white);border-radius:var(--r);box-shadow:var(--sh);border:1.5px solid var(--border);overflow:hidden}
+.pr-head{padding:15px 17px 10px}.pr-title{font-size:.93rem;font-weight:700}.pr-sub{font-size:.73rem;color:var(--t2);margin-top:1px}
+.pr-rows{padding:0 17px 15px;display:flex;flex-direction:column}
+.pr-row{display:flex;align-items:center;justify-content:space-between;padding:9px 0;border-bottom:1px solid var(--border)}
+.pr-row:last-child{border:none}
+.pr-name{font-size:.84rem;font-weight:600}.pr-zone{font-size:.68rem;color:var(--t3)}
+.pr-val{font-family:'JetBrains Mono',monospace;font-size:.85rem;background:var(--bg);padding:3px 9px;border-radius:7px}
+.pr-val.g{color:var(--green);background:var(--green-l)}
+
+/* AI */
+.ai-card{background:linear-gradient(135deg,#0f172a,#1e293b);border-radius:var(--r);padding:18px;color:#fff;position:relative;overflow:hidden}
+.ai-card::before{content:'';position:absolute;top:0;left:0;right:0;bottom:0;background:radial-gradient(circle at 80% 20%,rgba(74,222,128,.12) 0%,transparent 60%);pointer-events:none}
+.ai-hd{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+.ai-badge{background:rgba(74,222,128,.2);border:1px solid rgba(74,222,128,.3);color:var(--green-m);border-radius:20px;padding:3px 10px;font-size:.64rem;font-weight:700;letter-spacing:1px}
+.ai-title{font-size:.92rem;font-weight:700}
+.ai-chips{display:flex;flex-direction:column;gap:7px}
+.ai-chip{display:flex;align-items:center;gap:10px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);border-radius:10px;padding:10px 12px;cursor:pointer;transition:all .15s}
+.ai-chip:active{background:rgba(255,255,255,.12)}
+.ai-chip-ico{font-size:.95rem;flex-shrink:0}
+.ai-chip-txt{font-size:.78rem;color:rgba(255,255,255,.82);flex:1;line-height:1.3}
+.ai-chip-txt strong{color:#fff;font-weight:600}
+.ai-resp{margin-top:10px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);border-radius:10px;padding:11px;font-size:.78rem;line-height:1.5;color:rgba(255,255,255,.85);display:none}
+.ai-resp.vis{display:block}
+.ai-inp-row{display:flex;gap:8px;margin-top:10px}
+.ai-inp{flex:1;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15);border-radius:10px;padding:10px 12px;font-family:'Sora',sans-serif;font-size:.82rem;color:#fff;outline:none}
+.ai-inp::placeholder{color:rgba(255,255,255,.3)}
+.ai-send{width:40px;height:40px;background:var(--green);border:none;border-radius:9px;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.ai-send:active{transform:scale(.93)}
+
+/* SUB CARDS */
+.sub-row{display:flex;gap:12px}
+.sub-blue{flex:1;border-radius:20px;padding:20px 15px 18px;position:relative;overflow:hidden;cursor:pointer;transition:transform .18s,box-shadow .18s;background:linear-gradient(145deg,#1d4ed8,#3b82f6);box-shadow:0 8px 28px rgba(37,99,235,.38);min-height:205px;display:flex;flex-direction:column}
+.sub-blue:active{transform:scale(.97)}
+.sub-blue::before{content:'';position:absolute;top:-28px;right:-28px;width:100px;height:100px;border-radius:50%;background:rgba(255,255,255,.10)}
+.sub-black{flex:1;border-radius:20px;padding:20px 15px 18px;position:relative;overflow:hidden;cursor:pointer;transition:transform .18s,box-shadow .18s;background:linear-gradient(145deg,#0a0a0a,#1a1a1a);box-shadow:0 8px 28px rgba(0,0,0,.45),0 0 0 1px rgba(212,175,55,.25);min-height:205px;display:flex;flex-direction:column}
+.sub-black:active{transform:scale(.97)}
+.sub-black::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(212,175,55,.6),transparent)}
+.sc-tier{font-size:.58rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:4px}
+.sub-blue .sc-tier{color:rgba(255,255,255,.6)}.sub-black .sc-tier{color:#d4af37}
+.sc-name{font-size:.98rem;font-weight:800;color:#fff;margin-bottom:2px}
+.sc-logo{font-size:.7rem;font-weight:700;color:rgba(255,255,255,.38);margin-bottom:11px}
+.sub-black .sc-logo{color:rgba(212,175,55,.42)}
+.sc-chips{display:flex;gap:4px;margin-bottom:10px;flex-wrap:wrap}
+.sc-chip{font-size:.58rem;font-weight:600;padding:2px 6px;border-radius:20px}
+.sub-blue .sc-chip{background:rgba(255,255,255,.15);color:rgba(255,255,255,.9)}
+.sub-black .sc-chip{background:rgba(212,175,55,.12);color:#d4af37;border:1px solid rgba(212,175,55,.2)}
+.sc-pr-row{margin-top:auto;display:flex;align-items:flex-end;justify-content:space-between}
+.sc-price{font-family:'JetBrains Mono',monospace;font-size:1.45rem;font-weight:500;color:#fff;line-height:1}
+.sub-black .sc-price{color:#f5e37a}
+.sc-price-s{font-size:.62rem;color:rgba(255,255,255,.45);margin-left:1px}
+.sub-black .sc-price-s{color:rgba(212,175,55,.5)}
+.sc-cta{font-size:.68rem;font-weight:700;padding:6px 10px;border-radius:8px;border:none;cursor:pointer;font-family:'Sora',sans-serif}
+.sub-blue .sc-cta{background:rgba(255,255,255,.2);color:#fff}
+.sub-black .sc-cta{background:#d4af37;color:#111}
+.sc-pts-wrap{margin-top:7px}
+.sc-pts-hd{display:flex;justify-content:space-between;margin-bottom:4px}
+.sc-pts-lbl{font-size:.6rem;color:rgba(212,175,55,.7);font-weight:600}
+.sc-pts-val{font-family:'JetBrains Mono',monospace;font-size:.6rem;color:#d4af37}
+.sc-pts-bar{height:4px;border-radius:2px;background:rgba(212,175,55,.15);overflow:hidden}
+.sc-pts-fill{height:100%;border-radius:2px;background:linear-gradient(90deg,#b8962e,#f5e37a)}
+.sc-reward{margin-top:4px;font-size:.58rem;color:rgba(212,175,55,.68)}
+
+/* ACTION CARD */
+.action-card{background:var(--white);border-radius:var(--r);box-shadow:var(--sh);border:1.5px solid var(--border);overflow:hidden;cursor:pointer;transition:all .18s}
+.action-card:active{transform:scale(.985)}
+.ac-in{display:flex;align-items:center;padding:15px 17px;gap:13px}
+.ac-ico{width:46px;height:46px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:1.35rem;flex-shrink:0}
+.ac-ico.bl{background:var(--blue-l)}.ac-ico.or{background:var(--crowd-l)}
+.ac-title{font-size:.9rem;font-weight:700;margin-bottom:2px}
+.ac-sub{font-size:.74rem;color:var(--t2);line-height:1.3}
+.ac-arr{color:var(--t3)}
+
+/* BOTTOM NAV */
+.bnav{position:fixed;bottom:0;left:0;right:0;background:var(--white);border-top:1px solid var(--border);display:flex;padding:8px 0 calc(8px + env(safe-area-inset-bottom));z-index:1000;box-shadow:0 -4px 20px rgba(0,0,0,.06)}
+.ni{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;padding:4px;cursor:pointer;border:none;background:none;font-family:'Sora',sans-serif}
+.ni-ico{font-size:1.3rem;line-height:1}
+.ni-lbl{font-size:.6rem;font-weight:600;color:var(--t3)}
+.ni-dot{width:4px;height:4px;border-radius:50%;background:var(--green);display:none}
+.ni.active .ni-lbl{color:var(--green)}
+.ni.active .ni-dot{display:block}
+.nav-spacer{height:calc(70px + env(safe-area-inset-bottom))}
+
+/* MODALS */
+.mo{position:fixed;inset:0;background:rgba(15,23,42,.5);z-index:2000;display:flex;align-items:flex-end;opacity:0;pointer-events:none;transition:opacity .25s;backdrop-filter:blur(4px)}
+.mo.open{opacity:1;pointer-events:all}
+.ms{width:100%;background:var(--white);border-radius:20px 20px 0 0;padding:12px 20px 32px;transform:translateY(100%);transition:transform .3s cubic-bezier(.32,0,.67,0);max-height:90vh;overflow-y:auto}
+.mo.open .ms{transform:translateY(0);transition-timing-function:cubic-bezier(.33,1,.68,1)}
+.mh{width:36px;height:4px;background:var(--border);border-radius:2px;margin:0 auto 16px}
+.mt{font-size:1.12rem;font-weight:800;margin-bottom:3px}
+.ma{font-size:.8rem;color:var(--t2);margin-bottom:15px}
+.msg{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:15px}
+.msb{background:var(--bg);border-radius:11px;padding:11px}
+.msb-l{font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--t3);margin-bottom:3px}
+.msb-v{font-family:'JetBrains Mono',monospace;font-size:1.15rem;font-weight:500}
+.msb-v.green{color:var(--green)}.msb-v.yellow{color:var(--yellow)}.msb-v.blue{color:var(--blue)}
+.tl{font-size:.76rem;font-weight:700;color:var(--t2);margin-bottom:7px}
+.tbs{display:flex;gap:8px;margin-bottom:14px}
+.tb{flex:1;padding:11px 6px;border-radius:9px;border:2px solid var(--border);background:var(--white);font-family:'Sora',sans-serif;font-size:.88rem;font-weight:600;color:var(--t2);cursor:pointer;transition:all .15s}
+.tb.sel{border-color:var(--green);background:var(--green-l);color:var(--green)}
+.cdw{text-align:center;background:var(--bg);border-radius:11px;padding:13px;margin-bottom:13px;display:none}
+.cdw.vis{display:block}
+.cd-l{font-size:.66rem;font-weight:600;color:var(--t3);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px}
+.cd-v{font-family:'JetBrains Mono',monospace;font-size:2.3rem;font-weight:500;color:var(--green);letter-spacing:4px}
+.cd-v.warn{color:var(--red);animation:blink .5s infinite}
+.btn-ok{width:100%;background:var(--green);color:#fff;border:none;border-radius:12px;padding:14px;font-family:'Sora',sans-serif;font-size:.93rem;font-weight:700;cursor:pointer;transition:all .15s}
+.btn-ok:active{transform:scale(.98);opacity:.9}
+.btn-ok:disabled{background:var(--border);color:var(--t3);cursor:not-allowed;transform:none}
+
+/* Crowd modal */
+.ct-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px}
+.ct-btn{padding:13px 8px;border-radius:12px;border:2px solid var(--border);background:var(--white);font-family:'Sora',sans-serif;font-size:.8rem;font-weight:700;cursor:pointer;text-align:center;display:flex;flex-direction:column;align-items:center;gap:4px;transition:all .15s}
+.ct-btn .cti{font-size:1.4rem}
+.ct-btn.s-free{border-color:var(--green);background:var(--green-l);color:var(--green)}
+.ct-btn.s-paid{border-color:var(--blue);background:var(--blue-l);color:var(--blue)}
+.ct-btn.s-dis{border-color:var(--dis);background:var(--dis-l);color:var(--dis)}
+.ct-btn.s-full{border-color:var(--red);background:var(--red-l);color:var(--red)}
+.crowd-note{width:100%;padding:11px 13px;border:1.5px solid var(--border);border-radius:10px;font-family:'Sora',sans-serif;font-size:.85rem;resize:none;outline:none;margin-bottom:13px}
+.crowd-note:focus{border-color:var(--crowd)}
+
+/* Sub modals */
+.sm-hd-blue{background:linear-gradient(160deg,#1d4ed8,#3b82f6)}
+.sm-hd-black{background:linear-gradient(160deg,#0a0a0a,#1a1a1a)}
+.sm-hd{padding:20px 20px 14px;color:#fff}
+.sm-badge{font-size:.6rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;opacity:.7;margin-bottom:3px}
+.sm-hd-black .sm-badge{color:#d4af37;opacity:1}
+.sm-title{font-size:1.35rem;font-weight:800;color:#fff;margin-bottom:2px}
+.sm-hd-black .sm-title{color:#f5e37a}
+.sm-price{font-family:'JetBrains Mono',monospace;font-size:1.9rem;font-weight:500;color:#fff;line-height:1.1}
+.sm-hd-black .sm-price{color:#f5e37a}
+.sm-price span{font-size:.78rem;opacity:.6}
+.sm-body{background:var(--white);border-radius:20px 20px 0 0;padding:17px 20px 32px}
+.sm-feats{display:flex;flex-direction:column;gap:10px;margin-bottom:18px}
+.sf{display:flex;align-items:center;gap:11px}
+.sf-ico{width:33px;height:33px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:.9rem;flex-shrink:0}
+.sf-ico.bl{background:var(--blue-l)}.sf-ico.go{background:#fef3c7}
+.sf-name{font-size:.83rem;font-weight:700}.sf-desc{font-size:.7rem;color:var(--t2);margin-top:1px}
+.sm-cta{width:100%;padding:14px;border:none;border-radius:12px;font-family:'Sora',sans-serif;font-size:.93rem;font-weight:700;cursor:pointer;transition:all .15s}
+.sm-cta.blue{background:var(--blue);color:#fff}.sm-cta.black{background:#111;color:#d4af37}
+.sm-cta:active{opacity:.9;transform:scale(.98)}
+
+/* TOAST */
+.toast-progress{position:absolute;bottom:0;left:0;height:2px;background:var(--green);border-radius:0 0 13px 13px;animation:tprog 3.2s linear forwards}
+@keyframes tprog{from{width:100%}to{width:0%}}
+.toast{position:fixed;bottom:80px;left:16px;right:16px;background:var(--text);color:#fff;border-radius:12px;padding:13px 16px;font-size:.84rem;font-weight:600;z-index:3000;transform:translateY(20px);opacity:0;transition:all .3s cubic-bezier(.33,1,.68,1);display:flex;align-items:center;gap:8px;box-shadow:var(--sh-lg)}
+.toast.show{transform:translateY(0);opacity:1}
+
+/* Shimmer */
+@keyframes shimmer{0%{background-position:-200% 0}100%{background-position:200% 0}}
+.shimmer{background:linear-gradient(90deg,rgba(255,255,255,.04) 25%,rgba(255,255,255,.08) 50%,rgba(255,255,255,.04) 75%);background-size:200% 100%;animation:shimmer 1.4s infinite;border-radius:8px}
+
+/* Leaflet pins */
+.pk-pin{width:30px;height:30px;border-radius:50%;border:2.5px solid #fff;box-shadow:0 2px 10px rgba(0,0,0,.22);display:flex;align-items:center;justify-content:center;font-size:.62rem;font-weight:800;color:#fff;font-family:'Sora',sans-serif;cursor:pointer}
+.pk-pin.str{background:var(--blue)}.pk-pin.blu{background:var(--green)}.pk-pin.dis{background:var(--dis)}.pk-pin.cro{background:var(--crowd)}
+
+.leaflet-popup-content-wrapper{border-radius:13px!important;box-shadow:var(--sh-lg)!important;font-family:'Sora',sans-serif!important;padding:0!important;overflow:hidden}
+.leaflet-popup-content{margin:0!important;width:auto!important;min-width:175px}
+.leaflet-popup-tip-container{display:none}
+.pk-pop{padding:13px 15px}
+.pk-pop-type{font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:1px;margin-bottom:3px}
+.pk-pop-type.str{color:var(--blue)}.pk-pop-type.blu{color:var(--green)}.pk-pop-type.dis{color:var(--dis)}.pk-pop-type.cro{color:var(--crowd)}
+.pk-pop-name{font-size:.88rem;font-weight:700;margin-bottom:3px}
+.pk-pop-info{font-size:.76rem;color:var(--t2);margin-bottom:9px}
+.pk-pop-btn{width:100%;border:none;border-radius:8px;padding:8px;font-family:'Sora',sans-serif;font-size:.78rem;font-weight:700;cursor:pointer}
+.pk-pop-btn.green{background:var(--green);color:#fff}
+.pk-pop-btn.dis{background:var(--dis);color:#fff}
+
+/* Entry animation */
+@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+.sc>*{animation:fadeUp .4s ease both}
+.sc>*:nth-child(1){animation-delay:.05s}.sc>*:nth-child(2){animation-delay:.1s}.sc>*:nth-child(3){animation-delay:.15s}.sc>*:nth-child(4){animation-delay:.2s}.sc>*:nth-child(5){animation-delay:.25s}.sc>*:nth-child(6){animation-delay:.3s}.sc>*:nth-child(7){animation-delay:.35s}.sc>*:nth-child(8){animation-delay:.4s}.sc>*:nth-child(9){animation-delay:.45s}.sc>*:nth-child(10){animation-delay:.5s}
+
+/* ── AVATAR NAV ITEM ── */
+.ni-avatar{
+  width:28px;height:28px;border-radius:50%;
+  background:linear-gradient(135deg,#0a2e1a,var(--green));
+  color:#fff;font-weight:700;font-size:.68rem;
+  display:flex;align-items:center;justify-content:center;
+  overflow:hidden;border:2px solid var(--bd2);
+  transition:border-color .2s;
+}
+.ni.on .ni-avatar{border-color:var(--green);box-shadow:0 0 10px rgba(0,201,107,.3)}
+.ni-avatar img{width:100%;height:100%;object-fit:cover;border-radius:50%}
+
+
+/* ── PWA Standalone styles ── */
+.pwa-standalone .bnav{
+  padding-bottom:calc(12px + env(safe-area-inset-bottom));
+}
+.pwa-standalone .toast{
+  bottom:calc(88px + env(safe-area-inset-bottom));
+}
+/* Splash screen feel on load */
+@keyframes appFadeIn{from{opacity:0}to{opacity:1}}
+body{animation:appFadeIn .3s ease}
+
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="logo"><span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 10px var(--green);animation:grpulse 2s infinite;margin-right:6px;vertical-align:middle;margin-bottom:1px"></span>Park<em>Easy</em></div>
+  <div class="topbar-r">
+    <div class="live-pill"><div class="live-dot"></div>LIVE</div>
+    <button class="avatar">GP</button>
+  </div>
+</div>
+
+<div class="osm-bar" id="osmBar"><div class="osm-bar-fill"></div></div>
+
+<div class="map-section">
+  <div id="map"></div>
+  <div class="map-fade"></div>
+  <div class="map-search">
+    <input type="text" placeholder="🔍  Cerca via o parcheggio…" oninput="onSearch(this.value)" id="si">
+    <button class="locate-btn" onclick="centerMap()">
+      <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>
+    </button>
+  </div>
+  <div class="map-filters">
+    <div class="mf-pill on str" id="f-str" onclick="tog('str')"><div class="mf-dot" style="background:var(--blue)"></div>In struttura</div>
+    <div class="mf-pill on blu" id="f-blu" onclick="tog('blu')"><div class="mf-dot" style="background:var(--green)"></div>Strisce blu</div>
+    <div class="mf-pill on dis" id="f-dis" onclick="tog('dis')"><div class="mf-dot" style="background:var(--dis)"></div>♿ Disabili</div>
+    <div class="mf-pill on cro" id="f-cro" onclick="tog('cro')"><div class="mf-dot" style="background:var(--crowd)"></div>Segnalati</div>
+  </div>
+  <div class="map-stats">
+    <div class="ms"><div class="msdot" style="background:var(--blue)"></div><span id="stS">—</span></div>
+    <div class="mssep"></div>
+    <div class="ms"><div class="msdot" style="background:var(--green)"></div><span id="stB">—</span></div>
+    <div class="mssep"></div>
+    <div class="ms"><div class="msdot" style="background:var(--dis)"></div><span id="stD">—</span></div>
+    <div class="mssep"></div>
+    <div class="ms"><div class="msdot" style="background:var(--crowd)"></div><span id="stC">0</span> segn.</div>
+  </div>
+</div>
+
+<div class="sc">
+
+  <!-- CROWD BANNER -->
+  <div class="crowd-banner" onclick="openCrowdFlow()">
+    <div class="cb-ico">📣</div>
+    <div style="flex:1">
+      <div class="cb-title">Vedi un posto libero?</div>
+      <div class="cb-sub">Segnalalo in 2 secondi. Appare sulla mappa per 30 minuti e aiuta chi sta cercando parcheggio vicino a te.</div>
+      <button class="cb-cta" onclick="event.stopPropagation();openCrowdFlow()">📍 Segnala adesso</button>
+    </div>
+  </div>
+
+  <!-- PARCHEGGI VICINI -->
+  <div class="slbl">📍 Parcheggi vicini</div>
+  <div class="nearby" id="nearbyEl">
+    <div style="flex-shrink:0;width:162px;height:103px" class="shimmer"></div>
+    <div style="flex-shrink:0;width:162px;height:103px" class="shimmer"></div>
+    <div style="flex-shrink:0;width:162px;height:103px" class="shimmer"></div>
+  </div>
+
+  <!-- DISPONIBILITA' -->
+  <div class="slbl">📊 Disponibilità strutture</div>
+  <div class="avail-card">
+    <div class="av-head">
+      <div class="av-title">Parcheggi in struttura</div>
+      <div class="av-ref" onclick="refresh()">
+        <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>Aggiorna
+      </div>
+    </div>
+    <div class="av-rows" id="availEl">
+      <div style="height:27px" class="shimmer"></div>
+      <div style="height:27px" class="shimmer"></div>
+      <div style="height:27px" class="shimmer"></div>
+    </div>
+  </div>
+
+  <!-- LEGENDA -->
+  <div class="slbl">🗺 Legenda mappa</div>
+  <div class="legend-card">
+    <div class="lg-title">Come leggere i marker</div>
+    <div class="lg-rows">
+      <div class="lg-row"><div class="lg-pin" style="background:var(--blue)">🅿</div><div><div class="lg-name">In struttura</div><div class="lg-desc">Garage o area recintata — dati 5T / Comune di Torino · numero = posti liberi</div></div></div>
+      <div class="lg-row"><div class="lg-pin" style="background:var(--green)">P</div><div><div class="lg-name">Strisce blu</div><div class="lg-desc">Sosta a pagamento su strada — dati OpenStreetMap · €1,20–2,80/h</div></div></div>
+      <div class="lg-row"><div class="lg-pin" style="background:var(--dis)">♿</div><div><div class="lg-name">Posti disabili</div><div class="lg-desc">Stalli riservati — dati OpenStreetMap · gratuiti con contrassegno</div></div></div>
+      <div class="lg-row"><div class="lg-pin" style="background:var(--crowd)">👍</div><div><div class="lg-name">Segnalazioni utenti</div><div class="lg-desc">Posti liberi segnalati dalla community — scadono in 30 min</div></div></div>
+    </div>
+  </div>
+
+  <!-- SEGNALAZIONI ATTIVE -->
+  <div class="slbl">🙌 Segnalazioni attive</div>
+  <div id="segnEl"><div style="height:58px;border-radius:12px" class="shimmer"></div></div>
+
+  <!-- COME FUNZIONA -->
+  <div class="slbl">📖 Come funziona il crowdsourcing</div>
+  <div class="crowd-steps">
+    <div class="cs" onclick="openCrowdFlow()">
+      <div class="cs-num">1</div>
+      <div><div class="cs-title">Vedi un posto libero in strada</div><div class="cs-desc">Striscia bianca, blu, o posto disabili — qualsiasi posto che vedi libero conta.</div></div>
+    </div>
+    <div class="cs" onclick="openCrowdFlow()">
+      <div class="cs-num">2</div>
+      <div><div class="cs-title">Tocca "Segnala" e scegli il tipo</div><div class="cs-desc">Blu a pagamento, bianco gratuito, o disabili — così gli altri sanno cosa trovano.</div></div>
+    </div>
+    <div class="cs">
+      <div class="cs-num">3</div>
+      <div><div class="cs-title">Appare sulla mappa per 30 minuti</div><div class="cs-desc">Scade in automatico. Chi arriva prima lo trova, poi sparisce. Zero manutenzione.</div></div>
+    </div>
+  </div>
+
+  <!-- PRENOTA -->
+  <div class="slbl">🎯 Prenota uno stallo</div>
+  <div class="book-card" onclick="openBookDefault()">
+    <div class="bc-top"><div class="bc-ico">🅿️</div><div class="bc-badge">MAX 15 MIN PRIMA</div></div>
+    <div class="bc-title">Prenota il tuo posto</div>
+    <div class="bc-sub">Riserva uno stallo libero nei parcheggi in struttura e tienilo fino al tuo arrivo.</div>
+    <button class="bc-cta">Scegli parcheggio →</button>
+  </div>
+
+  <!-- PREZZI -->
+  <div class="slbl">💶 Tariffe Torino</div>
+  <div class="prices-card">
+    <div class="pr-head"><div class="pr-title">Sosta a Torino</div><div class="pr-sub">Dati GTT — aggiornati 2026</div></div>
+    <div class="pr-rows">
+      <div class="pr-row"><div><div class="pr-name">ZTL Centrale</div><div class="pr-zone">Zona A — centro storico</div></div><div class="pr-val">€ 2,80/h</div></div>
+      <div class="pr-row"><div><div class="pr-name">Tariffa ordinaria</div><div class="pr-zone">Zone B / C</div></div><div class="pr-val">€ 1,70/h</div></div>
+      <div class="pr-row"><div><div class="pr-name">Tariffa ridotta</div><div class="pr-zone">Zone periferiche</div></div><div class="pr-val">€ 1,50/h</div></div>
+      <div class="pr-row"><div><div class="pr-name">Tariffa Smart</div><div class="pr-zone">Ospedali e zone smart</div></div><div class="pr-val">€ 1,20/h</div></div>
+      <div class="pr-row"><div><div class="pr-name">Strisce bianche</div><div class="pr-zone">Tutto Torino</div></div><div class="pr-val g">Gratis</div></div>
+      <div class="pr-row"><div><div class="pr-name">Domenica e festivi</div><div class="pr-zone">Tutto Torino</div></div><div class="pr-val g">Gratis</div></div>
+      <div class="pr-row"><div><div class="pr-name">Disabili (contrassegno)</div><div class="pr-zone">Tutto Torino, H24</div></div><div class="pr-val g">Gratis</div></div>
+    </div>
+  </div>
+
+  <!-- AI -->
+  <div class="slbl">✨ Suggerimenti AI</div>
+  <div class="ai-card">
+    <div class="ai-hd"><div class="ai-badge">AI ASSISTANT</div><div class="ai-title">Dove parcheggio?</div></div>
+    <div class="ai-chips">
+      <div class="ai-chip" onclick="askAI('Dove parcheggio gratis vicino al centro di Torino?')"><div class="ai-chip-ico">🆓</div><div class="ai-chip-txt"><strong>Posto gratuito</strong> vicino al centro</div></div>
+      <div class="ai-chip" onclick="askAI('Sono disabile, dove trovo parcheggio riservato a Torino?')"><div class="ai-chip-ico">♿</div><div class="ai-chip-txt"><strong>Parcheggio disabili</strong> — dove trovarlo</div></div>
+      <div class="ai-chip" onclick="askAI('Voglio parcheggiare e prendere i mezzi pubblici a Torino, dove vado?')"><div class="ai-chip-ico">🚇</div><div class="ai-chip-txt"><strong>Park &amp; Ride</strong> + mezzo pubblico</div></div>
+    </div>
+    <div class="ai-resp" id="aiR"></div>
+    <div class="ai-inp-row">
+      <input class="ai-inp" id="aiI" placeholder="Chiedi qualcosa sui parcheggi…" onkeydown="if(event.key==='Enter')sendAI()">
+      <button class="ai-send" onclick="sendAI()"><svg width="17" height="17" fill="none" stroke="white" stroke-width="2.2" viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg></button>
+    </div>
+  </div>
+
+  <!-- ABBONAMENTI -->
+  <div class="slbl">💳 Abbonamenti</div>
+  <div class="sub-row">
+    <div class="sub-blue" onclick="openM('mBlue')">
+      <div class="sc-tier">Plus</div><div class="sc-name">ParkEasy Blue</div><div class="sc-logo">parkEasy</div>
+      <div class="sc-chips"><div class="sc-chip">Illimitate</div><div class="sc-chip">Notifiche</div><div class="sc-chip">No ads</div></div>
+      <div class="sc-pr-row">
+        <div class="sc-price">€3<span style="font-size:.82rem">,99</span><span class="sc-price-s">/mese</span></div>
+        <button class="sc-cta" onclick="event.stopPropagation();openM('mBlue')">Attiva →</button>
+      </div>
+    </div>
+    <div class="sub-black" onclick="openM('mBlack')">
+      <div class="sc-tier">Elite</div><div class="sc-name">ParkEasy Black</div><div class="sc-logo">parkEasy ✦</div>
+      <div class="sc-chips"><div class="sc-chip">Tutto di Blue</div><div class="sc-chip">Cashback</div></div>
+      <div class="sc-pts-wrap">
+        <div class="sc-pts-hd"><div class="sc-pts-lbl">Verso €2 sconto</div><div class="sc-pts-val" id="ptsV">340/500</div></div>
+        <div class="sc-pts-bar"><div class="sc-pts-fill" id="ptsF" style="width:68%"></div></div>
+        <div class="sc-reward">✦ +10 punti/parcheggio · 500 = €2 gratis</div>
+      </div>
+      <div class="sc-pr-row" style="margin-top:8px">
+        <div class="sc-price" style="font-size:1.2rem">€12<span class="sc-price-s">/mese</span></div>
+        <button class="sc-cta" onclick="event.stopPropagation();openM('mBlack')">Attiva →</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="action-card" onclick="showT('🧭 Apertura navigazione…')">
+    <div class="ac-in"><div class="ac-ico bl">🧭</div><div style="flex:1"><div class="ac-title">Naviga al parcheggio</div><div class="ac-sub">Apri le indicazioni nel tuo navigatore</div></div><div class="ac-arr">›</div></div>
+  </div>
+
+  <div class="nav-spacer"></div>
+</div>
+
+<!-- ══════════════════ AUTH SCREEN ══════════════════ -->
+<div id="authScreen">
+  <div class="auth-logo">
+    <div class="auth-logo-mark">🅿️</div>
+    <div class="auth-logo-name">Park<em>Easy</em></div>
+    <div class="auth-logo-sub">Parcheggia meglio a Torino</div>
+  </div>
+
+  <div class="auth-card">
+    <!-- Tabs -->
+    <div class="auth-tabs">
+      <div class="auth-tab active" id="tabLogin" onclick="switchAuthTab('login')">Accedi</div>
+      <div class="auth-tab" id="tabReg" onclick="switchAuthTab('reg')">Registrati</div>
+    </div>
+
+    <!-- Login form -->
+    <div class="auth-form" id="loginForm" style="display:flex">
+      <div class="field-wrap">
+        <div class="field-label">Email</div>
+        <input class="field-input" id="loginEmail" type="email" placeholder="nome@email.it" autocomplete="email">
+      </div>
+      <div class="field-wrap">
+        <div class="field-label">Password</div>
+        <input class="field-input" id="loginPass" type="password" placeholder="••••••••" autocomplete="current-password" onkeydown="if(event.key==='Enter')ParkAuth.loginEmail()">
+      </div>
+      <div class="err-msg" id="loginErr"></div>
+      <button class="btn-primary" id="btnLogin" onclick="ParkAuth.loginEmail()">Accedi</button>
+      <div class="divider">oppure</div>
+      <button class="btn-google" onclick="ParkAuth.loginGoogle()">
+        <svg class="google-ico" viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
+        Continua con Google
+      </button>
+      <button class="forgot-link" onclick="ParkAuth.resetPassword()">Password dimenticata?</button>
+    </div>
+
+    <!-- Register form -->
+    <div class="auth-form" id="regForm">
+      <div class="field-row">
+        <div class="field-wrap">
+          <div class="field-label">Nome</div>
+          <input class="field-input" id="regName" type="text" placeholder="Mario" autocomplete="given-name">
+        </div>
+        <div class="field-wrap">
+          <div class="field-label">Cognome</div>
+          <input class="field-input" id="regSurname" type="text" placeholder="Rossi" autocomplete="family-name">
+        </div>
+      </div>
+      <div class="field-wrap">
+        <div class="field-label">Email</div>
+        <input class="field-input" id="regEmail" type="email" placeholder="mario.rossi@email.it" autocomplete="email">
+      </div>
+      <div class="field-wrap">
+        <div class="field-label">Password</div>
+        <input class="field-input" id="regPass" type="password" placeholder="Minimo 6 caratteri" autocomplete="new-password">
+      </div>
+      <div class="field-wrap">
+        <div class="field-label">Conferma password</div>
+        <input class="field-input" id="regPass2" type="password" placeholder="Ripeti la password" autocomplete="new-password" onkeydown="if(event.key==='Enter')ParkAuth.registerEmail()">
+      </div>
+      <div class="err-msg" id="regErr"></div>
+      <button class="btn-primary" id="btnReg" onclick="ParkAuth.registerEmail()">Crea account</button>
+      <div class="divider">oppure</div>
+      <button class="btn-google" onclick="ParkAuth.loginGoogle()">
+        <svg class="google-ico" viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
+        Registrati con Google
+      </button>
+      <div style="font-size:.72rem;color:var(--t3);text-align:center;line-height:1.5">
+        Registrandoti accetti i <span style="color:var(--green);cursor:pointer">Termini di Servizio</span> e la <span style="color:var(--green);cursor:pointer">Privacy Policy</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════
+     PROFILO (bottom sheet panel)
+══════════════════════════════════════ -->
+
+<!-- Profile overlay -->
+<div id="profileOverlay" onclick="if(event.target===this)closeProfilePanel()"
+  style="position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:500;display:none;
+         align-items:flex-end;backdrop-filter:blur(6px);opacity:0;transition:opacity .25s">
+  <div id="profileSheet"
+    style="width:100%;max-height:92vh;overflow-y:auto;background:var(--bg);
+           border-radius:22px 22px 0 0;border-top:1px solid var(--bd2);
+           transform:translateY(100%);transition:transform .32s cubic-bezier(.32,0,.67,0);
+           padding:10px 16px 40px;scrollbar-width:none">
+
+    <!-- Handle -->
+    <div style="width:34px;height:4px;background:rgba(255,255,255,.15);border-radius:2px;margin:0 auto 18px"></div>
+
+    <!-- ── TESSERA ABBONAMENTO ── -->
+    <div style="margin-bottom:4px;font-size:.62rem;font-weight:700;text-transform:uppercase;letter-spacing:2px;color:var(--t3);padding-left:2px">La tua tessera</div>
+
+    <!-- Card contenitore (cambia aspetto in base al piano) -->
+    <div id="memberCard" style="border-radius:20px;padding:22px 20px 20px;position:relative;overflow:hidden;margin-bottom:14px;cursor:pointer;transition:transform .18s"
+         onclick="openSubModalFromProfile()">
+
+      <!-- Contenuto card — iniettato da JS -->
+      <div id="memberCardInner"></div>
+    </div>
+
+    <!-- ── AVATAR + INFO ── -->
+    <div style="background:var(--wh);border:1px solid var(--bd);border-radius:18px;padding:16px;margin-bottom:12px;display:flex;align-items:center;gap:14px">
+      <div id="profAvatarBig" style="width:54px;height:54px;border-radius:50%;background:linear-gradient(135deg,#0a2e1a,var(--green));color:#fff;font-weight:800;font-size:1.35rem;display:flex;align-items:center;justify-content:center;flex-shrink:0;overflow:hidden;border:2px solid rgba(0,201,107,.25)">?</div>
+      <div style="flex:1;min-width:0">
+        <div id="profNameBig" style="font-size:1rem;font-weight:800;margin-bottom:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">—</div>
+        <div id="profEmailBig" style="font-size:.73rem;color:var(--t2);margin-bottom:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">—</div>
+        <div style="display:flex;gap:8px">
+          <div style="background:var(--wh);border:1px solid var(--bd);border-radius:8px;padding:4px 10px;font-size:.65rem;font-weight:700;color:var(--t2);display:flex;flex-direction:column;align-items:center">
+            <div id="profBkCount" style="font-family:'JetBrains Mono',monospace;font-size:.95rem;color:var(--blue)">0</div>
+            <div>prenotazioni</div>
+          </div>
+          <div style="background:var(--wh);border:1px solid var(--bd);border-radius:8px;padding:4px 10px;font-size:.65rem;font-weight:700;color:var(--t2);display:flex;flex-direction:column;align-items:center" id="profPtsPill">
+            <div id="profPtsCount" style="font-family:'JetBrains Mono',monospace;font-size:.95rem;color:var(--gd)">0</div>
+            <div>punti</div>
+          </div>
+        </div>
+      </div>
+      <button onclick="openEditModal()" style="background:var(--wh);border:1px solid var(--bd);border-radius:9px;padding:7px 11px;font-family:'Sora',sans-serif;font-size:.7rem;font-weight:700;color:var(--t2);cursor:pointer;flex-shrink:0;transition:all .15s" onmouseover="this.style.borderColor='var(--green)'" onmouseout="this.style.borderColor='var(--bd)'">✏️</button>
+    </div>
+
+    <!-- ── UPGRADE BANNER (only free users) ── -->
+    <div id="upgradeBanner"
+      onclick="closeProfilePanel();setTimeout(()=>showPlansModal(),200)"
+      style="display:none;align-items:center;gap:12px;background:linear-gradient(135deg,rgba(0,201,107,.1),rgba(79,142,247,.06));border:1px solid rgba(0,201,107,.2);border-radius:14px;padding:13px 15px;margin-bottom:12px;cursor:pointer;transition:all .18s"
+      onmouseover="this.style.transform='scale(1.01)'" onmouseout="this.style.transform='scale(1)'">
+      <div style="width:36px;height:36px;border-radius:10px;background:var(--green-l,rgba(0,201,107,.12));border:1px solid rgba(0,201,107,.2);display:flex;align-items:center;justify-content:center;font-size:1rem;flex-shrink:0">⚡</div>
+      <div style="flex:1">
+        <div style="font-size:.84rem;font-weight:700;margin-bottom:1px;color:var(--green)">Sblocca più funzioni</div>
+        <div style="font-size:.72rem;color:var(--t2)">Prenotazioni illimitate e cashback da €3,99/mese</div>
+      </div>
+      <div style="font-size:.8rem;color:var(--green);font-weight:700;flex-shrink:0">Vedi →</div>
+    </div>
+
+    <!-- ── VEICOLO ── -->
+    <div style="background:var(--wh);border:1px solid var(--bd);border-radius:14px;margin-bottom:12px;overflow:hidden">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:13px 15px;border-bottom:1px solid var(--bd)">
+        <div style="font-size:.86rem;font-weight:700">🚗 Il tuo veicolo</div>
+        <button onclick="openVehicleEditModal()" style="background:var(--wh);border:1px solid var(--bd);border-radius:8px;padding:4px 10px;font-size:.7rem;font-weight:600;color:var(--t2);cursor:pointer;font-family:'Sora',sans-serif">Modifica</button>
+      </div>
+      <div id="profVehicle" style="padding:12px 15px;display:flex;align-items:center;gap:11px">
+        <div style="width:34px;height:34px;background:rgba(255,255,255,.05);border-radius:9px;border:1px solid var(--bd);display:flex;align-items:center;justify-content:center;font-size:1rem;flex-shrink:0">🚗</div>
+        <div style="color:var(--t3);font-size:.78rem">Nessun veicolo salvato</div>
+      </div>
+    </div>
+
+    <!-- ── STORICO ── -->
+    <div style="background:var(--wh);border:1px solid var(--bd);border-radius:14px;margin-bottom:12px;overflow:hidden">
+      <div style="padding:13px 15px;border-bottom:1px solid var(--bd);font-size:.86rem;font-weight:700">📋 Storico prenotazioni</div>
+      <div id="profHistList" style="padding:6px 9px;display:flex;flex-direction:column;gap:1px">
+        <div style="height:32px;margin:8px 6px;border-radius:8px" class="shimmer"></div>
+        <div style="height:32px;margin:8px 6px;border-radius:8px" class="shimmer"></div>
+      </div>
+    </div>
+
+    <!-- ── IMPOSTAZIONI ── -->
+    <div style="background:var(--wh);border:1px solid var(--bd);border-radius:14px;margin-bottom:12px;overflow:hidden">
+      <div style="padding:13px 15px;border-bottom:1px solid var(--bd);font-size:.86rem;font-weight:700">⚙️ Impostazioni</div>
+      <div onclick="showT('🔔 Notifiche push — in arrivo')" style="display:flex;align-items:center;justify-content:space-between;padding:12px 15px;cursor:pointer;border-bottom:1px solid var(--bd);transition:background .15s" onmouseover="this.style.background='var(--s3,rgba(255,255,255,.04))'" onmouseout="this.style.background='transparent'">
+        <span style="font-size:.84rem;font-weight:600">Notifiche push</span>
+        <span style="font-size:.72rem;color:var(--t3)">Attiva ›</span>
+      </div>
+      <div onclick="showT('🔒 I tuoi dati sono al sicuro (GDPR)')" style="display:flex;align-items:center;justify-content:space-between;padding:12px 15px;cursor:pointer;border-bottom:1px solid var(--bd);transition:background .15s" onmouseover="this.style.background='var(--s3,rgba(255,255,255,.04))'" onmouseout="this.style.background='transparent'">
+        <span style="font-size:.84rem;font-weight:600">Privacy e dati</span>
+        <span style="font-size:.72rem;color:var(--t3)">Visualizza ›</span>
+      </div>
+      <div onclick="doLogoutConfirm()" style="display:flex;align-items:center;justify-content:space-between;padding:12px 15px;cursor:pointer;transition:background .15s" onmouseover="this.style.background='rgba(244,63,94,.05)'" onmouseout="this.style.background='transparent'">
+        <span style="font-size:.84rem;font-weight:600;color:var(--red)">Esci dall'account</span>
+        <span style="font-size:.72rem;color:var(--t3)">›</span>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- Edit name modal -->
+<div class="sov" id="editNameModal" onclick="if(event.target===this)closeSheet('editNameModal')">
+  <div class="sheet">
+    <div class="sh-handle"></div>
+    <div class="sh-title">✏️ Modifica profilo</div>
+    <div class="sh-fm">
+      <div><div class="fl">Nome completo</div><input class="fi" id="editNameIn" type="text" placeholder="Mario Rossi"></div>
+      <button class="btn-main" id="btnSaveName" onclick="saveNameProf()">Salva</button>
+    </div>
+  </div>
+</div>
+
+<!-- Edit vehicle modal -->
+<div class="sov" id="editVehModal" onclick="if(event.target===this)closeSheet('editVehModal')">
+  <div class="sheet">
+    <div class="sh-handle"></div>
+    <div class="sh-title">🚗 Il tuo veicolo</div>
+    <div class="sh-fm">
+      <div><div class="fl">Targa</div><input class="fi" id="editVehTarga" type="text" placeholder="AB 123 CD" style="text-transform:uppercase;letter-spacing:2px;font-family:'JetBrains Mono',monospace"></div>
+      <div><div class="fl">Modello (opzionale)</div><input class="fi" id="editVehModel" type="text" placeholder="Fiat 500, Golf…"></div>
+      <button class="btn-main" id="btnSaveVeh" onclick="saveVehProf()">Salva veicolo</button>
+    </div>
+  </div>
+</div>
+
+<!-- Sub upgrade modal from profile -->
+<div class="sov" id="subUpgradeModal" onclick="if(event.target===this)closeSheet('subUpgradeModal')">
+  <div class="sheet" style="padding:0;overflow:hidden;border-radius:22px 22px 0 0">
+    <div id="subUpgradeInner"></div>
+  </div>
+</div>
+
+<!-- BOTTOM NAV -->
+<div class="bnav">
+  <button class="ni active" id="ni-mappa" onclick="setNav(this,'mappa')">
+    <div class="ni-ico">🗺</div><div class="ni-dot"></div><div class="ni-lbl">Mappa</div>
+  </button>
+  <button class="ni" id="ni-segnala" onclick="setNav(this,'segnala');openCrowdFlow()">
+    <div class="ni-ico">📣</div><div class="ni-dot"></div><div class="ni-lbl">Segnala</div>
+  </button>
+  <button class="ni" id="ni-prenota" onclick="setNav(this,'prenota');openBookDefault()">
+    <div class="ni-ico">🅿️</div><div class="ni-dot"></div><div class="ni-lbl">Prenota</div>
+  </button>
+  <button class="ni" id="ni-profilo" onclick="setNav(this,'profilo');openProfilePanel()">
+    <div class="ni-ico ni-avatar" id="niAvatar">👤</div>
+    <div class="ni-dot"></div>
+    <div class="ni-lbl" id="niAvatarLbl">Profilo</div>
+  </button>
+</div>
+
+<!-- MODAL: PRENOTA -->
+<div class="mo" id="mBook" onclick="if(event.target===this)closeM('mBook')">
+  <div class="ms">
+    <div class="mh"></div>
+    <div class="mt" id="bkT">—</div><div class="ma" id="bkA">—</div>
+    <div class="msg" id="bkSt"></div>
+    <div class="tl">Arrivo stimato (max 15 min prima)</div>
+    <div class="tbs">
+      <button class="tb" onclick="setT(this,5)">5 min</button>
+      <button class="tb sel" onclick="setT(this,10)">10 min</button>
+      <button class="tb" onclick="setT(this,15)">15 min</button>
+    </div>
+    <div class="cdw" id="cdW"><div class="cd-l">Tempo rimasto alla prenotazione</div><div class="cd-v" id="cdV">10:00</div></div>
+    <button class="btn-ok" id="bkBtn" onclick="confirmBook()">✓ Conferma prenotazione</button>
+  </div>
+</div>
+
+<!-- MODAL: SEGNALA -->
+<div class="mo" id="mCrowd" onclick="if(event.target===this)closeM('mCrowd')">
+  <div class="ms">
+    <div class="mh"></div>
+    <div class="mt">📣 Segnala un posto libero</div>
+    <div class="ma">La tua segnalazione è visibile per 30 minuti e aiuta tutti gli utenti vicini.</div>
+    <div id="coordLabel" style="display:flex;align-items:center;gap:6px;background:#fff7ed;border:1.5px solid #fed7aa;border-radius:9px;padding:8px 12px;font-size:.75rem;font-weight:600;color:#c2410c;margin-bottom:12px">
+      📍 <span>Nessun punto selezionato — chiudi e tocca la mappa</span>
+    </div>
+    <div style="font-size:.76rem;font-weight:700;color:var(--t2);margin-bottom:8px">Che tipo di posto hai visto?</div>
+    <div class="ct-grid">
+      <button class="ct-btn" id="ct-free" onclick="selCT('free')"><div class="cti">🟢</div>Striscia bianca<span style="font-size:.65rem;color:var(--t3);font-weight:400">Gratuito</span></button>
+      <button class="ct-btn" id="ct-paid" onclick="selCT('paid')"><div class="cti">🔵</div>Striscia blu<span style="font-size:.65rem;color:var(--t3);font-weight:400">A pagamento</span></button>
+      <button class="ct-btn" id="ct-dis" onclick="selCT('dis')"><div class="cti">♿</div>Posto disabili<span style="font-size:.65rem;color:var(--t3);font-weight:400">Con contrassegno</span></button>
+      <button class="ct-btn" id="ct-full" onclick="selCT('full')"><div class="cti">🔴</div>Zona piena<span style="font-size:.65rem;color:var(--t3);font-weight:400">Nessun posto</span></button>
+    </div>
+    <textarea class="crowd-note" id="cNote" rows="2" placeholder="Nota opzionale (es. 'angolo via Roma / via Po')…"></textarea>
+    <button class="btn-ok" onclick="submitS()">📍 Pubblica segnalazione</button>
+  </div>
+</div>
+
+<!-- MODAL: BLUE -->
+<div class="mo" id="mBlue" onclick="if(event.target===this)closeM('mBlue')">
+  <div class="ms" style="padding:0;overflow:hidden;border-radius:20px 20px 0 0">
+    <div class="sm-hd sm-hd-blue"><div style="width:36px;height:4px;background:rgba(255,255,255,.3);border-radius:2px;margin:0 auto 17px"></div><div class="sm-badge">ParkEasy Plus</div><div class="sm-title">Blue Card</div><div class="sm-price">€3,99 <span>/ mese</span></div></div>
+    <div class="sm-body">
+      <div class="sm-feats">
+        <div class="sf"><div class="sf-ico bl">🅿️</div><div><div class="sf-name">Prenotazioni illimitate</div><div class="sf-desc">Riserva stalli senza limiti mensili</div></div></div>
+        <div class="sf"><div class="sf-ico bl">🔔</div><div><div class="sf-name">Notifiche in tempo reale</div><div class="sf-desc">Avvisi su disponibilità e scadenze</div></div></div>
+        <div class="sf"><div class="sf-ico bl">🚫</div><div><div class="sf-name">Senza pubblicità</div><div class="sf-desc">Esperienza pulita e senza interruzioni</div></div></div>
+        <div class="sf"><div class="sf-ico bl">📊</div><div><div class="sf-name">Statistiche e storico</div><div class="sf-desc">Analisi spese e parcheggi preferiti</div></div></div>
+      </div>
+      <button class="sm-cta blue" onclick="activeSub('blue')">Abbonati per €3,99/mese</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL: BLACK -->
+<div class="mo" id="mBlack" onclick="if(event.target===this)closeM('mBlack')">
+  <div class="ms" style="padding:0;overflow:hidden;border-radius:20px 20px 0 0">
+    <div class="sm-hd sm-hd-black"><div style="width:36px;height:4px;background:rgba(212,175,55,.4);border-radius:2px;margin:0 auto 17px"></div><div class="sm-badge" style="color:#d4af37;opacity:1">ParkEasy Elite ✦</div><div class="sm-title" style="color:#f5e37a">Black Card</div><div class="sm-price" style="color:#f5e37a">€12 <span style="color:rgba(212,175,55,.6)">/ mese</span></div></div>
+    <div class="sm-body">
+      <div style="background:#fef9c3;border:1.5px solid #fde68a;border-radius:12px;padding:13px;margin-bottom:15px">
+        <div style="font-size:.68rem;font-weight:700;color:#92400e;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px">✦ Il tuo cashback</div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:7px">
+          <div><div style="font-family:'JetBrains Mono',monospace;font-size:1.4rem;color:#78350f">340</div><div style="font-size:.66rem;color:#a16207">punti accumulati</div></div>
+          <div style="text-align:right"><div style="font-family:'JetBrains Mono',monospace;font-size:1.4rem;color:#78350f">160</div><div style="font-size:.66rem;color:#a16207">punti mancanti</div></div>
+        </div>
+        <div style="height:7px;background:#fde68a;border-radius:4px;overflow:hidden;margin-bottom:5px"><div style="height:100%;width:68%;background:linear-gradient(90deg,#d97706,#f59e0b)"></div></div>
+        <div style="font-size:.68rem;color:#a16207">Ogni parcheggio <strong>+10 punti</strong> · 500 punti = <strong>€2 di sconto</strong></div>
+      </div>
+      <div class="sm-feats">
+        <div class="sf"><div class="sf-ico go">✦</div><div><div class="sf-name">Tutto di Blue incluso</div><div class="sf-desc">Prenotazioni, notifiche, no pubblicità</div></div></div>
+        <div class="sf"><div class="sf-ico go">🥇</div><div><div class="sf-name">Priorità sugli stalli</div><div class="sf-desc">Stalli prenotabili mostrati per primi</div></div></div>
+        <div class="sf"><div class="sf-ico go">💰</div><div><div class="sf-name">Cashback €2 ogni 500 punti</div><div class="sf-desc">+10 punti per ogni parcheggio completato</div></div></div>
+        <div class="sf"><div class="sf-ico go">🎧</div><div><div class="sf-name">Supporto prioritario 7/7</div><div class="sf-desc">Risposta entro 2 ore, tutti i giorni</div></div></div>
+      </div>
+      <button class="sm-cta black" onclick="activeSub('black')">Abbonati per €12/mese ✦</button>
+    </div>
+  </div>
+</div>
+
+
+<!-- ══════════════════════════════════════════════════
+     ONBOARDING — prima apertura app
+══════════════════════════════════════════════════ -->
+<div id="onboardingOverlay"
+  style="position:fixed;inset:0;z-index:800;display:none;align-items:flex-end;
+         background:rgba(0,0,0,.8);backdrop-filter:blur(8px);opacity:0;transition:opacity .3s">
+  <div id="onboardingSheet"
+    style="width:100%;background:var(--bg);border-radius:24px 24px 0 0;
+           border-top:1px solid var(--bd2);padding:12px 18px 40px;
+           transform:translateY(100%);transition:transform .35s cubic-bezier(.32,0,.67,0);
+           max-height:92vh;overflow-y:auto;scrollbar-width:none">
+
+    <!-- Handle -->
+    <div style="width:34px;height:4px;background:rgba(255,255,255,.15);border-radius:2px;margin:0 auto 20px"></div>
+
+    <!-- Hero -->
+    <div style="text-align:center;margin-bottom:24px">
+      <div style="width:64px;height:64px;border-radius:18px;background:linear-gradient(135deg,#0a2e1a,var(--green));
+                  display:flex;align-items:center;justify-content:center;font-size:1.8rem;
+                  margin:0 auto 14px;box-shadow:0 8px 24px rgba(0,201,107,.25)">🅿️</div>
+      <div style="font-size:1.3rem;font-weight:800;letter-spacing:-.5px;margin-bottom:5px">Benvenuto su <span style="color:var(--green)">ParkEasy</span></div>
+      <div style="font-size:.83rem;color:var(--t2);line-height:1.5;max-width:300px;margin:0 auto">
+        Trova parcheggio a Torino, segnala posti liberi e prenota il tuo stallo in pochi secondi.
+      </div>
+    </div>
+
+    <!-- 3 features -->
+    <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:24px">
+      <div style="display:flex;align-items:center;gap:13px;background:var(--wh);border:1px solid var(--bd);border-radius:14px;padding:13px">
+        <div style="width:40px;height:40px;border-radius:12px;background:var(--blue-l,rgba(79,142,247,.14));display:flex;align-items:center;justify-content:center;font-size:1.2rem;flex-shrink:0">🗺</div>
+        <div><div style="font-size:.86rem;font-weight:700;margin-bottom:2px">Mappa in tempo reale</div><div style="font-size:.74rem;color:var(--t2)">Strutture, strisce blu e posti disabili da OpenStreetMap</div></div>
+      </div>
+      <div style="display:flex;align-items:center;gap:13px;background:var(--wh);border:1px solid var(--bd);border-radius:14px;padding:13px">
+        <div style="width:40px;height:40px;border-radius:12px;background:rgba(249,115,22,.12);display:flex;align-items:center;justify-content:center;font-size:1.2rem;flex-shrink:0">📣</div>
+        <div><div style="font-size:.86rem;font-weight:700;margin-bottom:2px">Crowdsourcing istantaneo</div><div style="font-size:.74rem;color:var(--t2)">Segnala un posto libero — appare sulla mappa per 30 minuti</div></div>
+      </div>
+      <div style="display:flex;align-items:center;gap:13px;background:var(--wh);border:1px solid var(--bd);border-radius:14px;padding:13px">
+        <div style="width:40px;height:40px;border-radius:12px;background:var(--green-l,rgba(0,201,107,.12));display:flex;align-items:center;justify-content:center;font-size:1.2rem;flex-shrink:0">🅿️</div>
+        <div><div style="font-size:.86rem;font-weight:700;margin-bottom:2px">Prenota fino a 15 min prima</div><div style="font-size:.74rem;color:var(--t2)">Riserva uno stallo e tienilo garantito fino al tuo arrivo</div></div>
+      </div>
+    </div>
+
+    <!-- Abbonamenti preview -->
+    <div style="background:linear-gradient(135deg,rgba(0,201,107,.06),rgba(79,142,247,.04));border:1px solid rgba(0,201,107,.15);border-radius:16px;padding:16px;margin-bottom:20px">
+      <div style="font-size:.65rem;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;color:var(--green);margin-bottom:12px">✦ Diventa abbonato</div>
+      <div style="display:flex;gap:9px;margin-bottom:12px">
+        <!-- Blue mini -->
+        <div onclick="closeOnboarding();setTimeout(()=>showPlansModal(),300)"
+          style="flex:1;background:linear-gradient(145deg,#0f1f56,#1a3080);border-radius:12px;padding:13px 11px;cursor:pointer;border:1px solid rgba(79,142,247,.25);transition:transform .15s" onmouseover="this.style.transform='scale(1.02)'" onmouseout="this.style.transform='scale(1)'">
+          <div style="font-size:.57rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:rgba(79,142,247,.7);margin-bottom:3px">Plus</div>
+          <div style="font-size:.88rem;font-weight:800;color:#fff;margin-bottom:6px">Blue 💙</div>
+          <div style="font-size:.6rem;color:rgba(255,255,255,.45);margin-bottom:3px">✓ Prenotazioni illimitate</div>
+          <div style="font-size:.6rem;color:rgba(255,255,255,.45);margin-bottom:8px">✓ Notifiche live</div>
+          <div style="background:rgba(79,142,247,.2);border-radius:7px;padding:6px;text-align:center;font-family:'JetBrains Mono',monospace;font-size:.75rem;font-weight:600;color:#4f8ef7">€3,99/mese</div>
+        </div>
+        <!-- Black mini -->
+        <div onclick="closeOnboarding();setTimeout(()=>showPlansModal(),300)"
+          style="flex:1;background:linear-gradient(145deg,#090909,#151515);border-radius:12px;padding:13px 11px;cursor:pointer;border:1px solid rgba(232,196,106,.2);transition:transform .15s;position:relative;overflow:hidden" onmouseover="this.style.transform='scale(1.02)'" onmouseout="this.style.transform='scale(1)'">
+          <div style="position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(232,196,106,.4),transparent)"></div>
+          <div style="font-size:.57rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:rgba(232,196,106,.7);margin-bottom:3px">Elite</div>
+          <div style="font-size:.88rem;font-weight:800;color:#f5e8a0;margin-bottom:6px">Black ✦</div>
+          <div style="font-size:.6rem;color:rgba(232,196,106,.5);margin-bottom:3px">✓ Cashback €2/500 pt</div>
+          <div style="font-size:.6rem;color:rgba(232,196,106,.5);margin-bottom:8px">✓ Priorità stalli</div>
+          <div style="background:var(--gd,#e8c46a);border-radius:7px;padding:6px;text-align:center;font-family:'JetBrains Mono',monospace;font-size:.75rem;font-weight:600;color:#111">€12/mese</div>
+        </div>
+      </div>
+      <button onclick="closeOnboarding();setTimeout(()=>showPlansModal(),300)"
+        style="width:100%;padding:11px;border:none;border-radius:11px;background:var(--green);color:#000;font-family:'Sora',sans-serif;font-size:.88rem;font-weight:800;cursor:pointer;letter-spacing:.3px">
+        Scopri gli abbonamenti →
+      </button>
+    </div>
+
+    <!-- CTA principale -->
+    <button onclick="closeOnboarding()"
+      style="width:100%;padding:13px;border:1px solid var(--bd);border-radius:12px;background:transparent;color:var(--t2);font-family:'Sora',sans-serif;font-size:.86rem;font-weight:600;cursor:pointer">
+      Inizia gratis, decide dopo
+    </button>
+
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════
+     UPSELL POST-PRENOTAZIONE (compare dopo 1a prenotazione)
+══════════════════════════════════════════════════ -->
+<div class="sov" id="upsellSheet" onclick="if(event.target===this)closeSheet('upsellSheet')">
+  <div class="sheet" style="border-radius:22px 22px 0 0;border-top:1px solid var(--bd2)">
+    <div style="width:34px;height:4px;background:rgba(255,255,255,.15);border-radius:2px;margin:0 auto 16px"></div>
+
+    <!-- Success -->
+    <div style="text-align:center;margin-bottom:18px">
+      <div style="width:52px;height:52px;border-radius:50%;background:var(--green-l,rgba(0,201,107,.12));border:2px solid rgba(0,201,107,.25);display:flex;align-items:center;justify-content:center;font-size:1.5rem;margin:0 auto 10px">✅</div>
+      <div style="font-size:1.05rem;font-weight:800;margin-bottom:3px">Posto prenotato!</div>
+      <div style="font-size:.8rem;color:var(--t2)">Perfetto. Hai ancora qualche minuto per arrivare.</div>
+    </div>
+
+    <!-- Upsell message -->
+    <div style="background:linear-gradient(135deg,rgba(0,201,107,.08),rgba(79,142,247,.05));border:1px solid rgba(0,201,107,.18);border-radius:14px;padding:15px;margin-bottom:14px">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+        <div style="font-size:1.1rem">💡</div>
+        <div style="font-size:.84rem;font-weight:700">Prenoti spesso?</div>
+      </div>
+      <div style="font-size:.78rem;color:var(--t2);line-height:1.5;margin-bottom:12px">
+        Con <strong style="color:var(--green)">ParkEasy Blue</strong> hai prenotazioni illimitate e notifiche live. Con <strong style="color:var(--gd,#e8c46a)">Black</strong> guadagni anche punti cashback.
+      </div>
+      <div style="display:flex;gap:8px">
+        <button onclick="closeSheet('upsellSheet');setTimeout(()=>showPlansModal(),200)"
+          style="flex:1;padding:11px;border:none;border-radius:10px;background:var(--green);color:#000;font-family:'Sora',sans-serif;font-size:.82rem;font-weight:800;cursor:pointer">
+          Vedi i piani →
+        </button>
+        <button onclick="closeSheet('upsellSheet')"
+          style="padding:11px 14px;border:1px solid var(--bd);border-radius:10px;background:transparent;color:var(--t2);font-family:'Sora',sans-serif;font-size:.82rem;font-weight:600;cursor:pointer">
+          Dopo
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════
+     PLANS MODAL — confronto completo piani
+══════════════════════════════════════════════════ -->
+<div class="sov" id="plansModal" onclick="if(event.target===this)closeSheet('plansModal')">
+  <div class="sheet" style="border-radius:22px 22px 0 0;border-top:1px solid var(--bd2);max-height:92vh;overflow-y:auto;padding:10px 16px 36px">
+    <div style="width:34px;height:4px;background:rgba(255,255,255,.15);border-radius:2px;margin:0 auto 16px"></div>
+    <div style="font-size:1.05rem;font-weight:800;margin-bottom:4px">Scegli il tuo piano</div>
+    <div style="font-size:.78rem;color:var(--t2);margin-bottom:18px">Tutte le funzioni di ParkEasy, al livello che preferisci.</div>
+
+    <!-- FREE -->
+    <div style="background:var(--wh);border:1px solid var(--bd);border-radius:16px;padding:15px;margin-bottom:10px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+        <div>
+          <div style="font-size:.58rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--t3);margin-bottom:2px">Base</div>
+          <div style="font-size:.95rem;font-weight:800">Free</div>
+        </div>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:1rem;font-weight:600;color:var(--green)">€0</div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <div style="display:flex;align-items:center;gap:8px;font-size:.78rem;color:var(--t2)"><span style="color:var(--green);font-weight:700">✓</span> Mappa con tutti i parcheggi</div>
+        <div style="display:flex;align-items:center;gap:8px;font-size:.78rem;color:var(--t2)"><span style="color:var(--green);font-weight:700">✓</span> Crowdsourcing segnalazioni</div>
+        <div style="display:flex;align-items:center;gap:8px;font-size:.78rem;color:var(--t2)"><span style="color:var(--green);font-weight:700">✓</span> 3 prenotazioni al mese</div>
+        <div style="display:flex;align-items:center;gap:8px;font-size:.78rem;color:var(--t3)"><span style="color:var(--t3)">✕</span> Notifiche live</div>
+        <div style="display:flex;align-items:center;gap:8px;font-size:.78rem;color:var(--t3)"><span style="color:var(--t3)">✕</span> Cashback punti</div>
+      </div>
+    </div>
+
+    <!-- BLUE -->
+    <div style="background:linear-gradient(145deg,#0f1f56,#1a3080);border:1px solid rgba(79,142,247,.3);border-radius:16px;padding:15px;margin-bottom:10px;position:relative;overflow:hidden">
+      <div style="position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(79,142,247,.5),transparent)"></div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+        <div>
+          <div style="font-size:.58rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:rgba(79,142,247,.7);margin-bottom:2px">Plus</div>
+          <div style="font-size:.95rem;font-weight:800;color:#fff">Blue 💙</div>
+        </div>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:1rem;font-weight:600;color:#4f8ef7">€3,99<span style="font-size:.65rem;opacity:.6">/mese</span></div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:14px">
+        <div style="display:flex;align-items:center;gap:8px;font-size:.78rem;color:rgba(255,255,255,.8)"><span style="color:var(--green);font-weight:700">✓</span> Tutto di Free</div>
+        <div style="display:flex;align-items:center;gap:8px;font-size:.78rem;color:rgba(255,255,255,.8)"><span style="color:var(--green);font-weight:700">✓</span> <strong>Prenotazioni illimitate</strong></div>
+        <div style="display:flex;align-items:center;gap:8px;font-size:.78rem;color:rgba(255,255,255,.8)"><span style="color:var(--green);font-weight:700">✓</span> Notifiche live e scadenze</div>
+        <div style="display:flex;align-items:center;gap:8px;font-size:.78rem;color:rgba(255,255,255,.8)"><span style="color:var(--green);font-weight:700">✓</span> Senza pubblicità</div>
+        <div style="display:flex;align-items:center;gap:8px;font-size:.78rem;color:rgba(255,255,255,.8)"><span style="color:var(--green);font-weight:700">✓</span> Statistiche e storico completo</div>
+        <div style="display:flex;align-items:center;gap:8px;font-size:.78rem;color:rgba(255,255,255,.4)"><span style="color:rgba(255,255,255,.3)">✕</span> Cashback punti</div>
+      </div>
+      <button onclick="activateSub('blue');closeSheet('plansModal')"
+        style="width:100%;padding:12px;border:none;border-radius:11px;background:#4f8ef7;color:#fff;font-family:'Sora',sans-serif;font-size:.88rem;font-weight:800;cursor:pointer;letter-spacing:.3px">
+        Attiva Blue — €3,99/mese
+      </button>
+    </div>
+
+    <!-- BLACK -->
+    <div style="background:linear-gradient(145deg,#090909,#151515);border:1px solid rgba(232,196,106,.2);border-radius:16px;padding:15px;margin-bottom:18px;position:relative;overflow:hidden">
+      <div style="position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(232,196,106,.5),transparent)"></div>
+      <div style="position:absolute;top:8px;right:12px;background:var(--gd,#e8c46a);color:#111;font-size:.58rem;font-weight:800;letter-spacing:1px;padding:3px 8px;border-radius:20px;text-transform:uppercase">Più scelto</div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+        <div>
+          <div style="font-size:.58rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:rgba(232,196,106,.7);margin-bottom:2px">Elite</div>
+          <div style="font-size:.95rem;font-weight:800;color:#f5e8a0">Black ✦</div>
+        </div>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:1rem;font-weight:600;color:#e8c46a">€12<span style="font-size:.65rem;opacity:.6">/mese</span></div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:14px">
+        <div style="display:flex;align-items:center;gap:8px;font-size:.78rem;color:rgba(255,255,255,.8)"><span style="color:var(--green);font-weight:700">✓</span> Tutto di Blue</div>
+        <div style="display:flex;align-items:center;gap:8px;font-size:.78rem;color:rgba(255,255,255,.8)"><span style="color:var(--green);font-weight:700">✓</span> <strong style="color:#f5e8a0">Cashback: +10 punti/parcheggio</strong></div>
+        <div style="display:flex;align-items:center;gap:8px;font-size:.78rem;color:rgba(255,255,255,.8)"><span style="color:var(--green);font-weight:700">✓</span> <strong style="color:#f5e8a0">500 punti = €2 di sconto</strong></div>
+        <div style="display:flex;align-items:center;gap:8px;font-size:.78rem;color:rgba(255,255,255,.8)"><span style="color:var(--green);font-weight:700">✓</span> Stalli mostrati in priorità</div>
+        <div style="display:flex;align-items:center;gap:8px;font-size:.78rem;color:rgba(255,255,255,.8)"><span style="color:var(--green);font-weight:700">✓</span> Supporto dedicato 7/7 (2h)</div>
+      </div>
+      <button onclick="activateSub('black');closeSheet('plansModal')"
+        style="width:100%;padding:12px;border:none;border-radius:11px;background:var(--gd,#e8c46a);color:#111;font-family:'Sora',sans-serif;font-size:.88rem;font-weight:800;cursor:pointer;letter-spacing:.3px">
+        Attiva Black — €12/mese ✦
+      </button>
+    </div>
+
+    <div style="text-align:center;font-size:.72rem;color:var(--t3);line-height:1.5">
+      Puoi cambiare o annullare in qualsiasi momento.<br>
+      Nessun vincolo contrattuale.
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const TC=[45.0703,7.6869];
+const BBOX='44.98,7.58,45.15,7.80';
+const OVP='https://overpass-api.de/api/interpreter';
+
+let map,layers={},osmEls=[],crowds=[],selPark=null,selMins=10,cdInt=null,crowdType=null;
+
+const strutture=[
+  {id:'s1', name:'Valdo Fusi',    addr:'Via Giolitti',         lat:45.0665,lon:7.6897,lib:58, tot:458},
+  {id:'s2', name:'Castello',      addr:'Piazza Castello',      lat:45.0712,lon:7.6851,lib:12, tot:802},
+  {id:'s3', name:'Porta Palazzo', addr:'P.za Repubblica',      lat:45.0762,lon:7.6823,lib:0,  tot:300},
+  {id:'s4', name:'Palagiustizia', addr:'C.so Vittorio Em. II', lat:45.0678,lon:7.6761,lib:210,tot:506},
+  {id:'s5', name:'Fontanesi',     addr:'Via Fontanesi',        lat:45.0780,lon:7.6910,lib:42, tot:362},
+  {id:'s6', name:'Bodoni',        addr:'Piazza Bodoni',        lat:45.0638,lon:7.6828,lib:3,  tot:468},
+  {id:'s7', name:'Stura P&R',     addr:'Corso Romania',        lat:45.1102,lon:7.6944,lib:380,tot:600},
+  {id:'s8', name:'Porta Nuova',   addr:'Piazza Carlo Felice',  lat:45.0618,lon:7.6783,lib:0,  tot:242},
+  {id:'s9', name:'Cernaia',       addr:'Via Bertolotti',       lat:45.0726,lon:7.6734,lib:20, tot:94 },
+  {id:'s10',name:'Lingotto',      addr:'Via Nizza 262',        lat:45.0345,lon:7.6658,lib:90, tot:200},
+  {id:'s11',name:'Palestro',      addr:'Via Bertola',          lat:45.0731,lon:7.6793,lib:8,  tot:121},
+  {id:'s12',name:'Bixio',         addr:'C.so Galileo F.',      lat:45.0603,lon:7.6839,lib:130,tot:266},
+];
+
+// ── MAP ────────────────────────────────────────────────────
+function initMap(){
+  map=L.map('map',{zoomControl:false,attributionControl:false}).setView(TC,14);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{subdomains:'abcd',maxZoom:19}).addTo(map);
+  L.control.zoom({position:'bottomright'}).addTo(map);
+  ['str','blu','dis','cro'].forEach(t=>{layers[t]=L.layerGroup().addTo(map)});
+  const ui=L.divIcon({html:`<div style="width:14px;height:14px;background:#3b82f6;border:3px solid #fff;border-radius:50%;box-shadow:0 2px 8px rgba(59,130,246,.5)"></div>`,iconSize:[14,14],iconAnchor:[7,7],className:''});
+  L.marker(TC,{icon:ui}).addTo(map).bindPopup('<b>Sei qui</b>');
+}
+
+// ── OSM OVERPASS ──────────────────────────────────────────
+async function loadOSM(){
+  // Query 1: strisce blu su strada
+  const qBlu=`[out:json][timeout:25][bbox:${BBOX}];(node["amenity"="parking"]["fee"="yes"];node["amenity"="parking"]["parking"="street_side"];);out body 500;`;
+  // Query 2: posti disabili — tutti i tag ufficiali OSM
+  // parking_space=disabled e' il tag corrente
+  // access=disabled e' legacy ma ancora molto usato
+  // capacity:disabled su amenity=parking = parcheggio con stalli riservati
+  const qDis=`[out:json][timeout:25][bbox:${BBOX}];(node["amenity"="parking_space"]["parking_space"="disabled"];node["amenity"="parking_space"]["access"="disabled"];node["amenity"="parking"]["capacity:disabled"];node["amenity"="parking"]["disabled"="yes"];);out body 300;`;
+  try{
+    const [rBlu,rDis]=await Promise.all([
+      fetch(OVP,{method:'POST',body:'data='+encodeURIComponent(qBlu),signal:AbortSignal.timeout(18000)}),
+      fetch(OVP,{method:'POST',body:'data='+encodeURIComponent(qDis),signal:AbortSignal.timeout(18000)}),
+    ]);
+    const [dBlu,dDis]=await Promise.all([rBlu.json(),rDis.json()]);
+    const elBlu=(dBlu.elements||[]).map(e=>({...e,_tipo:'blu'}));
+    const elDis=(dDis.elements||[]).map(e=>({...e,_tipo:'dis'}));
+    osmEls=[...elBlu,...elDis];
+    if(osmEls.length===0) throw new Error('empty');
+    console.log(`OSM caricato: ${elBlu.length} strisce blu, ${elDis.length} posti disabili`);
+  }catch(e){
+    console.warn('Overpass non raggiungibile, uso dati demo:',e.message);
+    osmEls=demoOSM();
+  }
+  renderOSM();
+  updateStats();
+  osmDone();
+}
+
+function demoOSM(){
+  const blu=[
+    {id:1001,lat:45.0700,lon:7.6820,tags:{amenity:'parking',fee:'yes',name:'Strisce Blu P.za Castello'}},
+    {id:1002,lat:45.0740,lon:7.6762,tags:{amenity:'parking',fee:'yes',name:'Strisce Blu Via Garibaldi'}},
+    {id:1003,lat:45.0660,lon:7.6812,tags:{amenity:'parking',fee:'yes',name:'Strisce Blu Via Roma'}},
+    {id:1004,lat:45.0680,lon:7.6902,tags:{amenity:'parking',fee:'yes',name:'Strisce Blu C.so Vittorio'}},
+    {id:1005,lat:45.0722,lon:7.6952,tags:{amenity:'parking',fee:'yes',name:'Strisce Blu Via Po'}},
+    {id:1006,lat:45.0752,lon:7.6842,tags:{amenity:'parking',fee:'yes',name:'Strisce Blu Via Cernaia'}},
+    {id:1007,lat:45.0630,lon:7.6752,tags:{amenity:'parking',fee:'yes',name:'Strisce Blu San Salvario'}},
+    {id:1008,lat:45.0578,lon:7.6792,tags:{amenity:'parking',fee:'yes',name:'Strisce Blu Valentino'}},
+    {id:1009,lat:45.0800,lon:7.6872,tags:{amenity:'parking',fee:'yes',name:'Strisce Blu Porta Palazzo'}},
+    {id:1010,lat:45.0692,lon:7.6692,tags:{amenity:'parking',fee:'yes',name:'Strisce Blu Crocetta'}},
+    {id:1011,lat:45.0650,lon:7.7010,tags:{amenity:'parking',fee:'yes',name:'Strisce Blu Vanchiglia'}},
+    {id:1012,lat:45.0810,lon:7.6700,tags:{amenity:'parking',fee:'yes',name:'Strisce Blu Borgo Dora'}},
+  ];
+  const dis=[
+    {id:2001,lat:45.0715,lon:7.6855,tags:{amenity:'parking_space',access:'disabled',name:'Posto Disabili P.za Castello'}},
+    {id:2002,lat:45.0668,lon:7.6893,tags:{amenity:'parking_space',access:'disabled',name:'Posto Disabili Valdo Fusi'}},
+    {id:2003,lat:45.0735,lon:7.6770,tags:{amenity:'parking_space',access:'disabled',name:'Posto Disabili Via Garibaldi'}},
+    {id:2004,lat:45.0622,lon:7.6788,tags:{amenity:'parking_space',access:'disabled',name:'Posto Disabili Porta Nuova'}},
+    {id:2005,lat:45.0785,lon:7.6915,tags:{amenity:'parking_space',access:'disabled',name:'Posto Disabili Via Coppino'}},
+    {id:2006,lat:45.0710,lon:7.6990,tags:{amenity:'parking_space',access:'disabled',name:'Posto Disabili Vanchiglia'}},
+  ];
+  return [...blu,...dis];
+}
+
+function osmDone(){
+  const b=document.getElementById('osmBar');
+  b.classList.add('done');
+  setTimeout(()=>b.style.display='none',900);
+}
+
+function renderOSM(){
+  layers.blu.clearLayers();
+  layers.dis.clearLayers();
+  osmEls.forEach(el=>{
+    if(!el.lat||!el.lon)return;
+    const t=el.tags||{};
+    // Usa _tipo marcato in loadOSM; fallback su tag OSM
+    const isDis=el._tipo==='dis'||t.parking_space==='disabled'||(t.amenity==='parking_space')||t.access==='disabled';
+    const tipo=isDis?'dis':'blu';
+    const name=t.name||(isDis?'Posto disabili':'Sosta su strada');
+    const capDis=t['capacity:disabled']?' ('+t['capacity:disabled']+' stalli)':'';
+    const ico=L.divIcon({html:'<div class="pk-pin '+tipo+'">'+(isDis?'♿':'P')+'</div>',iconSize:[30,30],iconAnchor:[15,15],className:''});
+    const infoTxt=isDis?'Riservato — contrassegno richiesto'+capDis:'A pagamento GTT \u00b7 \u20ac1,20\u20132,80/h \u00b7 lun-sab 8:00\u201319:30';
+    const btnTxt=isDis?'Naviga \u267f':'Vai qui';
+    const btnCls=isDis?'dis':'green';
+    const btnAct=isDis?"showT('\u267f Stallo riservato \u2014 contrassegno obbligatorio')"
+                      :"showT('\u2139\ufe0f Verifica disponibilit\u00e0 in loco')";
+    const m=L.marker([el.lat,el.lon],{icon:ico}).bindPopup(
+      '<div class="pk-pop">'+
+      '<div class="pk-pop-type '+tipo+'">'+(isDis?'\u267f Posto disabili':'\ud83d\udd35 Sosta su strada')+'</div>'+
+      '<div class="pk-pop-name">'+name+'</div>'+
+      '<div class="pk-pop-info">'+infoTxt+'</div>'+
+      '<button class="pk-pop-btn '+btnCls+'" onclick="'+btnAct+'">'+btnTxt+'</button>'+
+      '</div>',{closeButton:false});
+    layers[tipo].addLayer(m);
+  });
+}
+
+function renderStrutture(){
+  layers.str.clearLayers();
+  strutture.forEach(p=>{
+    const pct=p.tot>0?p.lib/p.tot:0;
+    const col=p.lib===0?'#ef4444':pct<.25?'#eab308':'#2563eb';
+    const ico=L.divIcon({html:`<div class="pk-pin str" style="background:${col}">${p.lib>0?p.lib:'X'}</div>`,iconSize:[30,30],iconAnchor:[15,15],className:''});
+    const m=L.marker([p.lat,p.lon],{icon:ico}).bindPopup(`
+      <div class="pk-pop">
+        <div class="pk-pop-type str">🅿 In struttura</div>
+        <div class="pk-pop-name">${p.name}</div>
+        <div class="pk-pop-info">${p.lib>0?p.lib+' posti liberi su '+p.tot:'Pieno — '+p.tot+' posti totali'}</div>
+        ${p.lib>0?`<button class="pk-pop-btn green" onclick="openBook('${p.id}')">Prenota →</button>`:'<div style="color:var(--red);font-size:.75rem;font-weight:600">Non disponibile</div>'}
+      </div>`,{closeButton:false});
+    m.on('click',()=>selPark=p);
+    layers.str.addLayer(m);
+  });
+}
+
+// ── FILTERS ────────────────────────────────────────────────
+const filterState={str:true,blu:true,dis:true,cro:true};
+function tog(t){
+  filterState[t]=!filterState[t];
+  document.getElementById('f-'+t).classList.toggle('on',filterState[t]);
+  filterState[t]?layers[t].addTo(map):map.removeLayer(layers[t]);
+}
+
+// ── STATS ──────────────────────────────────────────────────
+function updateStats(){
+  const nS=strutture.filter(p=>p.lib>0).length;
+  const nB=osmEls.filter(e=>e._tipo==='blu').length;
+  const nD=osmEls.filter(e=>e._tipo==='dis').length;
+  document.getElementById('stS').textContent=nS+' strutture';
+  document.getElementById('stB').textContent=nB+' aree';
+  document.getElementById('stD').textContent=nD+' stalli';
+  document.getElementById('stC').textContent=crowds.length;
+}
+
+// ── NEARBY ─────────────────────────────────────────────────
+function renderNearby(){
+  const el=document.getElementById('nearbyEl');
+  const all=[
+    ...strutture.map(p=>({id:p.id,name:p.name,tipo:'str',spots:p.lib,stato:p.lib===0?'busy':p.lib/p.tot<.25?'few':'free',sel:selPark?.id===p.id})),
+    ...crowds.map(c=>({id:c.id,name:c.tipo==='dis'?'Posto disabili':c.tipo==='paid'?'Striscia blu':'Posto libero',tipo:'cro',spots:1,stato:'free',sel:false})),
+  ];
+  el.innerHTML=all.map(p=>`
+    <div class="nc ${p.sel?'sel':''}" onclick="ncClick('${p.id}','${p.tipo}')">
+      <div class="nc-bar ${p.tipo}"></div>
+      <div class="nc-name">${p.name}</div>
+      <div class="nc-badge ${p.tipo}">${p.tipo==='str'?'Struttura':p.tipo==='cro'?'Segnalato':'OSM'}</div>
+      <div class="nc-num ${p.stato==='busy'?'busy':p.stato==='few'?'few':'free'}">${p.stato==='busy'?'—':p.spots}</div>
+      <div class="nc-lbl">${p.stato==='busy'?'pieno':'posti liberi'}</div>
+    </div>`).join('');
+}
+
+function ncClick(id,tipo){
+  if(tipo==='str'){selPark=strutture.find(p=>p.id===id);if(selPark)map.panTo([selPark.lat,selPark.lon]);}
+  renderNearby();
+}
+
+// ── AVAIL ──────────────────────────────────────────────────
+function renderAvail(){
+  document.getElementById('availEl').innerHTML=strutture.map(p=>{
+    const pct=p.tot>0?Math.round(p.lib/p.tot*100):0;
+    const cls=p.lib===0?'busy':pct<25?'few':'free';
+    return `<div class="av-row" onclick="ncClick('${p.id}','str')">
+      <div class="avdot" style="background:var(--blue)"></div>
+      <div class="av-name">${p.name}</div>
+      <div class="av-bar"><div class="av-fill ${cls}" style="width:${pct}%"></div></div>
+      <div class="av-cnt ${cls}">${p.lib>0?p.lib:'Pieno'}</div>
+    </div>`;
+  }).join('');
+}
+
+// ── SEGNALAZIONI ───────────────────────────────────────────
+function renderSegn(){
+  const w=document.getElementById('segnEl');
+  if(crowds.length===0){
+    w.innerHTML=`<div style="background:var(--white);border:1.5px solid var(--border);border-radius:12px;padding:16px;text-align:center;color:var(--t3);font-size:.8rem">
+      Nessuna segnalazione attiva.<br>Sii il primo a segnalare un posto! 👆
+    </div>`;return;
+  }
+  const lbl={free:'Striscia bianca 🟢',paid:'Striscia blu 🔵',dis:'Posto disabili ♿',full:'Zona piena 🔴'};
+  w.innerHTML=`<div class="segn-list">${crowds.map(c=>{
+    const rim=Math.max(0,Math.round((c.exp-Date.now())/60000));
+    return `<div class="segn-item">
+      <div class="segn-ico">${c.tipo==='dis'?'♿':c.tipo==='paid'?'🔵':c.tipo==='full'?'🔴':'🟢'}</div>
+      <div style="flex:1"><div class="segn-name">${lbl[c.tipo]||'Posto libero'}</div><div class="segn-time">${c.note||'Segnalato adesso'} · scade in ${rim} min</div></div>
+      <div class="segn-cnt">+1</div>
+    </div>`;
+  }).join('')}</div>`;
+}
+
+// ── CROWD MODAL ────────────────────────────────────────────
+let crowdPendingLat=null,crowdPendingLon=null,crowdPickMode=false;
+
+function openCrowdFlow(){
+  // Step 1: chiudi modal se aperto, entra in modalità selezione punto
+  closeM('mCrowd');
+  crowdPickMode=true;
+  crowdPendingLat=null; crowdPendingLon=null;
+  showT('📍 Tocca il punto esatto sulla mappa dove hai visto il posto libero');
+  // Cursore crosshair sulla mappa
+  document.getElementById('map').style.cursor='crosshair';
+  // Listener click mappa — una sola volta
+  map.once('click',function(e){
+    crowdPendingLat=e.latlng.lat;
+    crowdPendingLon=e.latlng.lng;
+    crowdPickMode=false;
+    document.getElementById('map').style.cursor='';
+    // Mostra marker temporaneo di anteprima
+    if(window._crowdPreview) map.removeLayer(window._crowdPreview);
+    const prevIco=L.divIcon({html:'<div style="width:28px;height:28px;border-radius:50%;background:#ea580c;border:3px solid #fff;box-shadow:0 2px 10px rgba(0,0,0,.3);display:flex;align-items:center;justify-content:center;font-size:.9rem">📍</div>',iconSize:[28,28],iconAnchor:[14,14],className:''});
+    window._crowdPreview=L.marker([crowdPendingLat,crowdPendingLon],{icon:prevIco,zIndexOffset:1000}).addTo(map);
+    // Step 2: apri modal per scegliere tipo
+    openM('mCrowd');
+    // Aggiorna label posizione nel modal
+    const coordEl=document.getElementById('coordLabel');
+    if(coordEl) coordEl.textContent='📍 '+crowdPendingLat.toFixed(5)+', '+crowdPendingLon.toFixed(5);
+  });
+}
+
+function selCT(t){
+  crowdType=t;
+  document.querySelectorAll('.ct-btn').forEach(b=>b.className='ct-btn');
+  const m={free:'s-free',paid:'s-paid',dis:'s-dis',full:'s-full'};
+  document.getElementById('ct-'+t).classList.add(m[t]);
+}
+
+function submitS(){
+  if(!crowdType){showT('⚠️ Scegli il tipo di posto');return;}
+  if(!crowdPendingLat){showT('⚠️ Prima tocca il punto sulla mappa');openM('mCrowd');setTimeout(()=>closeM('mCrowd'),200);openCrowdFlow();return;}
+  const note=document.getElementById('cNote').value.trim();
+  // Rimuovi marker anteprima
+  if(window._crowdPreview){map.removeLayer(window._crowdPreview);window._crowdPreview=null;}
+  const item={
+    id:'c'+Date.now(),tipo:crowdType,note,
+    lat:crowdPendingLat,
+    lon:crowdPendingLon,
+    exp:Date.now()+30*60*1000,
+  };
+  crowdPendingLat=null; crowdPendingLon=null;
+  crowds.push(item);
+  // Add marker
+  const ico={free:'🟢',paid:'🔵',dis:'♿',full:'🔴'}[item.tipo]||'👍';
+  const mi=L.divIcon({html:`<div class="pk-pin cro">${ico}</div>`,iconSize:[30,30],iconAnchor:[15,15],className:''});
+  const mm=L.marker([item.lat,item.lon],{icon:mi}).bindPopup(`
+    <div class="pk-pop"><div class="pk-pop-type cro">👤 Segnalazione</div>
+    <div class="pk-pop-name">${{free:'Striscia bianca',paid:'Striscia blu',dis:'Posto disabili',full:'Zona piena'}[item.tipo]}</div>
+    <div class="pk-pop-info">${note||'Segnalato adesso'}</div></div>`,{closeButton:false});
+  layers.cro.addLayer(mm);item._m=mm;
+  renderSegn();renderNearby();
+  document.getElementById('stC').textContent=crowds.length;
+  document.getElementById('cNote').value='';crowdType=null;
+  document.querySelectorAll('.ct-btn').forEach(b=>b.className='ct-btn');
+  closeM('mCrowd');
+  showT('✅ Segnalazione pubblicata — visibile 30 minuti');
+  setTimeout(()=>{
+    crowds=crowds.filter(c=>c.id!==item.id);
+    if(item._m)layers.cro.removeLayer(item._m);
+    renderSegn();renderNearby();
+    document.getElementById('stC').textContent=crowds.length;
+  },30*60*1000);
+}
+
+// ── BOOK MODAL ─────────────────────────────────────────────
+function openBookDefault(){selPark=selPark||strutture.find(p=>p.lib>0)||strutture[0];openBook(selPark.id);}
+function openBook(id){
+  const p=strutture.find(x=>x.id===id);
+  if(!p)return;
+  if(p.lib===0){showT('❌ Parcheggio pieno');return;}
+  selPark=p;
+  const pct=Math.round(p.lib/p.tot*100);
+  const cls=p.lib/p.tot<.25?'yellow':'green';
+  document.getElementById('bkT').textContent=p.name;
+  document.getElementById('bkA').textContent=p.addr;
+  document.getElementById('bkSt').innerHTML=`
+    <div class="msb"><div class="msb-l">Posti liberi</div><div class="msb-v ${cls}">${p.lib}</div></div>
+    <div class="msb"><div class="msb-l">Totale</div><div class="msb-v">${p.tot}</div></div>
+    <div class="msb"><div class="msb-l">Disponibilità</div><div class="msb-v ${cls}">${pct}%</div></div>
+    <div class="msb"><div class="msb-l">Tariffa</div><div class="msb-v blue">da €1,20/h</div></div>`;
+  document.getElementById('cdW').classList.remove('vis');
+  document.getElementById('bkBtn').disabled=false;
+  document.getElementById('bkBtn').textContent='✓ Conferma prenotazione';
+  document.querySelectorAll('.tb').forEach((b,i)=>b.classList.toggle('sel',i===1));
+  selMins=10;if(cdInt)clearInterval(cdInt);
+  openM('mBook');
+}
+function setT(el,m){document.querySelectorAll('.tb').forEach(b=>b.classList.remove('sel'));el.classList.add('sel');selMins=m;document.getElementById('cdW').classList.remove('vis');if(cdInt)clearInterval(cdInt);}
+function confirmBook(){
+  document.getElementById('cdW').classList.add('vis');
+  document.getElementById('bkBtn').disabled=true;
+  document.getElementById('bkBtn').textContent='⏳ Prenotazione attiva…';
+  let tot=selMins*60;tick(tot);
+  cdInt=setInterval(()=>{tot--;tick(tot);if(tot<=0){clearInterval(cdInt);closeM('mBook');showT('⏰ Prenotazione scaduta');}},1000);
+  showT('✅ Posto riservato! Hai '+selMins+' min per arrivare');
+}
+function tick(s){
+  const e=document.getElementById('cdV');
+  e.textContent=String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');
+  e.classList.toggle('warn',s<=60);
+}
+
+// ── SUB ────────────────────────────────────────────────────
+function activeSub(t){closeM(t==='blue'?'mBlue':'mBlack');showT('🎉 ParkEasy '+(t==='blue'?'Blue':'Black')+' attivato!');}
+
+// ── MODALS UTILS ───────────────────────────────────────────
+function openM(id){document.getElementById(id).classList.add('open');document.body.style.overflow='hidden';}
+function closeM(id){document.getElementById(id).classList.remove('open');document.body.style.overflow='';if(cdInt&&id==='mBook')clearInterval(cdInt);}
+
+// ── SEARCH ─────────────────────────────────────────────────
+function onSearch(q){
+  if(!q)return;
+  const ql=q.toLowerCase();
+  const p=strutture.find(p=>p.name.toLowerCase().includes(ql)||p.addr.toLowerCase().includes(ql));
+  if(p){map.panTo([p.lat,p.lon],{animate:true});selPark=p;renderNearby();}
+}
+function centerMap(){map.flyTo(TC,14,{animate:true,duration:.8});showT('📍 Centrato su Torino');}
+
+// ── NAV ────────────────────────────────────────────────────
+function setNav(el){document.querySelectorAll('.ni').forEach(i=>i.classList.remove('active'));el.classList.add('active');}
+
+// ── AI ─────────────────────────────────────────────────────
+function askAI(q){document.getElementById('aiI').value=q;sendAI();}
+async function sendAI(){
+  const i=document.getElementById('aiI'),q=i.value.trim();if(!q)return;i.value='';
+  const r=document.getElementById('aiR');r.className='ai-resp vis';r.innerHTML='<em style="opacity:.4">⏳ Cerco…</em>';
+  try{
+    const res=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:1000,
+        system:`Sei ParkEasy AI per Torino. Strutture: Valdo Fusi(58/458 liberi,€1,50/h), Castello(12/802,€2/h), Porta Palazzo(PIENO,€1,20/h), Palagiustizia(210/506,€1/h), Fontanesi(42/362,€1/h), Bodoni(3/468,€2/h), Stura P&R(380/600,€1+bus), Porta Nuova(PIENO,€2,20/h), Cernaia(20/94,€1,50/h), Lingotto(90/200,€1,20/h), Palestro(8/121,€2,50/h), Bixio(130/266). Strisce blu: €1,20-2,80/h, gratis domenica e festivi. Posti disabili: gratuiti con contrassegno, distribuiti in tutta la città. Crowdsourcing: utenti segnalano posti liberi in tempo reale (30 min). Rispondi in italiano, max 3 righe, pratico e specifico con nome parcheggio.`,
+        messages:[{role:'user',content:q}]})});
+    const d=await res.json();r.innerHTML=d.content?.[0]?.text||'Nessuna risposta.';
+  }catch{
+    const ql=q.toLowerCase();
+    r.innerHTML=ql.includes('gratis')||ql.includes('bianca')
+      ?'🟢 <strong>Strisce bianche:</strong> gratuite, cerca le strisce bianche sulla mappa. Park&Ride Stura: €1+bus, 380 posti. Lingotto (90 liberi, €1,20/h).'
+      :ql.includes('disabil')
+      ?'♿ <strong>Posti disabili:</strong> gratuiti con contrassegno. Visibili come marker viola sulla mappa. Distribuiti in tutta la città, no prenotazione.'
+      :ql.includes('mezzo')||ql.includes('metro')||ql.includes('ride')
+      ?'🚇 <strong>Park & Ride Stura</strong> (corso Romania): 380 posti, €1+bus giornaliero. Metro/bus al centro in 15 min. Alternativa: Caio Mario, Venchi Unica.'
+      :'🅿️ <strong>Migliore adesso:</strong> Palagiustizia (210 liberi, €1/h, vicino Porta Susa) oppure Bixio (130 liberi) per la zona sud. Usa la mappa per vedere tutto.';
+  }
+}
+
+// ── REFRESH ────────────────────────────────────────────────
+function refresh(){renderNearby();renderAvail();renderSegn();updateStats();showT('🔄 Dati aggiornati');}
+
+// ── TOAST ──────────────────────────────────────────────────
+function showT(msg){const t=document.getElementById('toast');t.innerHTML=msg+'<div class="toast-progress"></div>';t.classList.add('show');clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('show'),3200);}
+
+// ── INIT ───────────────────────────────────────────────────
+window.addEventListener('load',async()=>{
+  initMap();
+  renderStrutture();
+  setTimeout(()=>{renderNearby();renderAvail();renderSegn();updateStats();},300);
+  await loadOSM();
+});
+
+
+// ══════════════════════════════════════════════════════════
+//  PROFILE PANEL
+// ══════════════════════════════════════════════════════════
+
+function openProfilePanel(){
+  const ov=document.getElementById('profileOverlay');
+  const sh=document.getElementById('profileSheet');
+  if(!ov||!sh)return;
+  ov.style.display='flex';
+  document.body.style.overflow='hidden';
+  requestAnimationFrame(()=>{
+    ov.style.opacity='1';
+    sh.style.transform='translateY(0)';
+    sh.style.transitionTimingFunction='cubic-bezier(.33,1,.68,1)';
+  });
+  renderProfilePanel();
+}
+
+function closeProfilePanel(){
+  const ov=document.getElementById('profileOverlay');
+  const sh=document.getElementById('profileSheet');
+  if(!ov||!sh)return;
+  ov.style.opacity='0';
+  sh.style.transform='translateY(100%)';
+  sh.style.transitionTimingFunction='cubic-bezier(.32,0,.67,0)';
+  setTimeout(()=>{ov.style.display='none';document.body.style.overflow='';},320);
+  // reset nav
+  document.querySelectorAll('.ni').forEach(n=>n.classList.remove('on'));
+  document.getElementById('ni-mappa')?.classList.add('on');
+}
+
+function renderProfilePanel(){
+  const u=window.ParkAuth?.user || G?.user;
+  const p=window.ParkAuth?.profile || G?.prof;
+
+  // Avatar big
+  const avEl=document.getElementById('profAvatarBig');
+  if(avEl){
+    if(u?.photoURL) avEl.innerHTML=`<img src="${u.photoURL}" style="width:100%;height:100%;object-fit:cover;border-radius:50%">`;
+    else{const n=p?.name||u?.displayName||u?.email?.split('@')[0]||'U';avEl.textContent=n.split(' ').map(w=>w[0]).join('').toUpperCase().slice(0,2);}
+  }
+
+  // Name / email
+  const nm=p?.name||u?.displayName||u?.email?.split('@')[0]||'Utente';
+  const el=document.getElementById;
+  el('profNameBig') && (el('profNameBig').textContent=nm);
+  el('profEmailBig') && (el('profEmailBig').textContent=u?.email||'Ospite');
+  el('profBkCount') && (el('profBkCount').textContent=p?.bookingsCount||0);
+  el('profPtsCount') && (el('profPtsCount').textContent=p?.points||0);
+
+  // Member card
+  renderMemberCard(p, nm);
+
+  // Vehicle
+  renderVehicleSection(p);
+
+  // History
+  renderHistorySection();
+  maybeShowUpgradeBanner();
+
+  // Update bottom nav avatar
+  updateNavAvatar(u, p);
+}
+
+function renderMemberCard(p, nm){
+  const card=document.getElementById('memberCard');
+  const inner=document.getElementById('memberCardInner');
+  if(!card||!inner)return;
+
+  const plan=p?.plan||'free';
+  const pts=p?.points||0;
+  const bkCount=p?.bookingsCount||0;
+  const pct=Math.min(100,(pts%500)/5);
+  const vehicle=p?.vehicle?.targa||'';
+
+  if(plan==='black'){
+    // ── BLACK GOLD CARD ──
+    card.style.cssText=`border-radius:20px;padding:22px 20px 20px;position:relative;overflow:hidden;margin-bottom:14px;cursor:pointer;transition:transform .18s;
+      background:linear-gradient(145deg,#090909,#151515);
+      box-shadow:0 12px 40px rgba(0,0,0,.6),0 0 0 1px rgba(232,196,106,.2);`;
+    inner.innerHTML=`
+      <div style="position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(232,196,106,.55),transparent)"></div>
+      <div style="position:absolute;bottom:-60px;right:-40px;width:160px;height:160px;border-radius:50%;background:radial-gradient(circle,rgba(232,196,106,.1),transparent 70%)"></div>
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:16px">
+        <div>
+          <div style="font-size:.58rem;font-weight:700;letter-spacing:2.5px;text-transform:uppercase;color:rgba(232,196,106,.7);margin-bottom:4px">ParkEasy Elite ✦</div>
+          <div style="font-size:1.2rem;font-weight:800;color:#f5e8a0;letter-spacing:-.3px">${nm}</div>
+        </div>
+        <div style="background:rgba(232,196,106,.12);border:1px solid rgba(232,196,106,.2);border-radius:20px;padding:4px 11px;font-size:.62rem;font-weight:700;color:#e8c46a;white-space:nowrap">Black ✦</div>
+      </div>
+      ${vehicle?`<div style="font-family:'JetBrains Mono',monospace;font-size:.92rem;font-weight:600;color:rgba(232,196,106,.85);letter-spacing:3px;margin-bottom:14px">${vehicle}</div>`:''}
+      <div style="margin-bottom:8px">
+        <div style="display:flex;justify-content:space-between;margin-bottom:5px">
+          <div style="font-size:.62rem;color:rgba(232,196,106,.6);font-weight:600">Cashback verso €2</div>
+          <div style="font-family:'JetBrains Mono',monospace;font-size:.62rem;color:#e8c46a">${pts%500}/500 pt</div>
+        </div>
+        <div style="height:4px;background:rgba(232,196,106,.1);border-radius:2px;overflow:hidden">
+          <div style="height:100%;width:${pct}%;background:linear-gradient(90deg,#b8922a,#f5e37a);border-radius:2px;transition:width .8s ease"></div>
+        </div>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div style="font-size:.6rem;color:rgba(232,196,106,.45)">✦ +10 punti per ogni parcheggio</div>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:.65rem;color:rgba(232,196,106,.5)">${String(bkCount).padStart(4,'0')} park</div>
+      </div>`;
+  } else if(plan==='blue'){
+    // ── BLUE CARD ──
+    card.style.cssText=`border-radius:20px;padding:22px 20px 20px;position:relative;overflow:hidden;margin-bottom:14px;cursor:pointer;transition:transform .18s;
+      background:linear-gradient(145deg,#0f1f56,#1a3080);
+      box-shadow:0 12px 40px rgba(15,31,86,.5),0 0 0 1px rgba(79,142,247,.2);`;
+    inner.innerHTML=`
+      <div style="position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(79,142,247,.5),transparent)"></div>
+      <div style="position:absolute;top:-30px;right:-30px;width:120px;height:120px;border-radius:50%;background:rgba(255,255,255,.06)"></div>
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:16px">
+        <div>
+          <div style="font-size:.58rem;font-weight:700;letter-spacing:2.5px;text-transform:uppercase;color:rgba(79,142,247,.7);margin-bottom:4px">ParkEasy Plus</div>
+          <div style="font-size:1.2rem;font-weight:800;color:#fff;letter-spacing:-.3px">${nm}</div>
+        </div>
+        <div style="background:rgba(79,142,247,.2);border:1px solid rgba(79,142,247,.3);border-radius:20px;padding:4px 11px;font-size:.62rem;font-weight:700;color:#4f8ef7;white-space:nowrap">Blue 💙</div>
+      </div>
+      ${vehicle?`<div style="font-family:'JetBrains Mono',monospace;font-size:.92rem;font-weight:600;color:rgba(255,255,255,.75);letter-spacing:3px;margin-bottom:14px">${vehicle}</div>`:''}
+      <div style="display:flex;gap:16px">
+        <div style="font-size:.68rem;color:rgba(255,255,255,.5)">🅿️ Prenotazioni illimitate</div>
+        <div style="font-size:.68rem;color:rgba(255,255,255,.5)">🔔 Notifiche live</div>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px">
+        <div style="font-size:.6rem;color:rgba(255,255,255,.35)">€ 3,99/mese</div>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:.65rem;color:rgba(255,255,255,.3)">${String(bkCount).padStart(4,'0')} park</div>
+      </div>`;
+  } else {
+    // ── FREE CARD (invita all'upgrade) ──
+    card.style.cssText=`border-radius:20px;padding:22px 20px 20px;position:relative;overflow:hidden;margin-bottom:14px;cursor:pointer;transition:transform .18s;
+      background:linear-gradient(145deg,var(--wh),rgba(255,255,255,.04));
+      border:1px dashed rgba(255,255,255,.15);`;
+    inner.innerHTML=`
+      <div style="display:flex;align-items:center;gap:14px;margin-bottom:14px">
+        <div style="width:48px;height:48px;border-radius:14px;background:rgba(255,255,255,.05);border:1px solid var(--bd);display:flex;align-items:center;justify-content:center;font-size:1.5rem">🅿️</div>
+        <div>
+          <div style="font-size:.58rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--t3);margin-bottom:3px">Account Free</div>
+          <div style="font-size:.95rem;font-weight:800;color:var(--tx)">${nm}</div>
+        </div>
+      </div>
+      ${vehicle?`<div style="font-family:'JetBrains Mono',monospace;font-size:.88rem;font-weight:600;color:var(--t2);letter-spacing:3px;margin-bottom:12px">${vehicle}</div>`:''}
+      <div style="background:rgba(0,201,107,.08);border:1px solid rgba(0,201,107,.2);border-radius:11px;padding:11px 13px;display:flex;align-items:center;justify-content:space-between">
+        <div style="font-size:.75rem;color:rgba(0,201,107,.85);font-weight:600">Upgrade a Blue o Black</div>
+        <div style="font-size:.75rem;color:var(--green);font-weight:700">da €3,99 →</div>
+      </div>`;
+  }
+}
+
+function renderVehicleSection(p){
+  const el=document.getElementById('profVehicle');
+  if(!el)return;
+  if(p?.vehicle?.targa){
+    el.innerHTML=`
+      <div style="width:34px;height:34px;background:rgba(255,255,255,.05);border-radius:9px;border:1px solid var(--bd);display:flex;align-items:center;justify-content:center;font-size:1rem;flex-shrink:0">🚗</div>
+      <div>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:.9rem;font-weight:600;letter-spacing:2px">${p.vehicle.targa}</div>
+        <div style="font-size:.73rem;color:var(--t2);margin-top:1px">${p.vehicle.model||p.vehicle.modello||'Veicolo'}</div>
+      </div>`;
+  } else {
+    el.innerHTML=`<div style="width:34px;height:34px;background:rgba(255,255,255,.05);border-radius:9px;border:1px solid var(--bd);display:flex;align-items:center;justify-content:center;font-size:1rem;flex-shrink:0">🚗</div><div style="color:var(--t3);font-size:.78rem">Nessun veicolo salvato</div>`;
+  }
+}
+
+function renderHistorySection(){
+  const el=document.getElementById('profHistList');
+  if(!el)return;
+  const bk=window.ParkAuth?.bookings||G?.bookings||[];
+  if(!bk.length){el.innerHTML='<div style="padding:16px;text-align:center;color:var(--t3);font-size:.77rem">Nessuna prenotazione ancora. Inizia a usare ParkEasy! 🅿️</div>';return;}
+  el.innerHTML=bk.map(b=>{
+    const d=b.createdAt?.toDate?b.createdAt.toDate():new Date();
+    const dt=d.toLocaleDateString('it-IT',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'});
+    return`<div style="display:flex;align-items:center;gap:10px;padding:9px 6px;border-radius:9px;transition:background .15s" onmouseover="this.style.background='rgba(255,255,255,.03)'" onmouseout="this.style.background='transparent'">
+      <div style="width:29px;height:29px;border-radius:8px;background:rgba(255,255,255,.05);border:1px solid var(--bd);display:flex;align-items:center;justify-content:center;font-size:.82rem;flex-shrink:0">🅿️</div>
+      <div style="flex:1">
+        <div style="font-size:.77rem;font-weight:700">${b.parkName||'—'}</div>
+        <div style="font-size:.65rem;color:var(--t3);margin-top:1px">${dt} · ${b.minuti||'—'} min</div>
+      </div>
+      <div style="font-family:'JetBrains Mono',monospace;font-size:.77rem;color:var(--green)">${b.price||'—'}</div>
+    </div>`;
+  }).join('');
+}
+
+function updateNavAvatar(u, p){
+  const av=document.getElementById('niAvatar');
+  if(!av)return;
+  if(u?.photoURL){
+    av.innerHTML=`<img src="${u.photoURL}" style="width:100%;height:100%;object-fit:cover;border-radius:50%">`;
+  } else {
+    const n=p?.name||u?.displayName||u?.email||'U';
+    const ini=n.split(' ').map(w=>w[0]).join('').toUpperCase().slice(0,2);
+    av.textContent=ini;
+    // Color by plan
+    const planColors={free:'linear-gradient(135deg,#1a1a2e,#4f8ef7)',blue:'linear-gradient(135deg,#0f1f56,#4f8ef7)',black:'linear-gradient(135deg,#0a0a0a,#e8c46a)'};
+    av.style.background=planColors[p?.plan||'free']||planColors.free;
+  }
+  // Label shows first name
+  const lbl=document.getElementById('niAvatarLbl');
+  if(lbl){
+    const nm=p?.name||u?.displayName||'';
+    lbl.textContent=nm.split(' ')[0]||'Profilo';
+  }
+}
+
+function openSubModalFromProfile(){
+  const p=window.ParkAuth?.profile||G?.prof;
+  const plan=p?.plan||'free';
+  // Show upgrade options
+  const inner=document.getElementById('subUpgradeInner');
+  if(!inner)return;
+
+  if(plan==='black'){
+    inner.innerHTML=`
+      <div style="padding:20px;text-align:center">
+        <div style="font-size:1.1rem;font-weight:800;margin-bottom:4px;color:#f5e8a0">✦ ParkEasy Black attivo</div>
+        <div style="font-size:.82rem;color:var(--t2);margin-bottom:16px">Il tuo abbonamento premium è attivo.</div>
+        <button class="btn-main" onclick="closeSheet('subUpgradeModal')">Chiudi</button>
+      </div>`;
+  } else {
+    inner.innerHTML=`
+      <div style="padding:16px 18px 32px">
+        <div style="width:34px;height:4px;background:rgba(255,255,255,.12);border-radius:2px;margin:0 auto 16px"></div>
+        <div style="font-size:1rem;font-weight:800;margin-bottom:14px">Scegli il tuo piano</div>
+        <div style="display:flex;gap:10px;margin-bottom:16px">
+          <div onclick="activateSub('blue')" style="flex:1;border-radius:16px;padding:16px 13px;background:linear-gradient(145deg,#0f1f56,#1a3080);border:1px solid rgba(79,142,247,.25);cursor:pointer;transition:transform .18s;display:flex;flex-direction:column" onmouseover="this.style.transform='scale(1.02)'" onmouseout="this.style.transform='scale(1)'">
+            <div style="font-size:.58rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:rgba(79,142,247,.7);margin-bottom:3px">Plus</div>
+            <div style="font-size:.95rem;font-weight:800;color:#fff;margin-bottom:8px">Blue 💙</div>
+            <div style="font-size:.62rem;color:rgba(255,255,255,.5);margin-bottom:4px">✓ Prenotazioni illimitate</div>
+            <div style="font-size:.62rem;color:rgba(255,255,255,.5);margin-bottom:4px">✓ Notifiche live</div>
+            <div style="font-size:.62rem;color:rgba(255,255,255,.5);margin-bottom:12px">✓ No pubblicità</div>
+            <div style="margin-top:auto;background:rgba(79,142,247,.2);border:1px solid rgba(79,142,247,.3);border-radius:8px;padding:8px;text-align:center;font-size:.8rem;font-weight:700;color:#4f8ef7">€3,99/mese</div>
+          </div>
+          <div onclick="activateSub('black')" style="flex:1;border-radius:16px;padding:16px 13px;background:linear-gradient(145deg,#090909,#151515);border:1px solid rgba(232,196,106,.2);cursor:pointer;transition:transform .18s;display:flex;flex-direction:column;position:relative" onmouseover="this.style.transform='scale(1.02)'" onmouseout="this.style.transform='scale(1)'">
+            <div style="position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(232,196,106,.4),transparent)"></div>
+            <div style="font-size:.58rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:rgba(232,196,106,.7);margin-bottom:3px">Elite</div>
+            <div style="font-size:.95rem;font-weight:800;color:#f5e8a0;margin-bottom:8px">Black ✦</div>
+            <div style="font-size:.62rem;color:rgba(232,196,106,.55);margin-bottom:4px">✓ Tutto di Blue</div>
+            <div style="font-size:.62rem;color:rgba(232,196,106,.55);margin-bottom:4px">✓ Cashback €2 / 500 pt</div>
+            <div style="font-size:.62rem;color:rgba(232,196,106,.55);margin-bottom:12px">✓ Priorità stalli</div>
+            <div style="margin-top:auto;background:var(--gd);border-radius:8px;padding:8px;text-align:center;font-size:.8rem;font-weight:700;color:#111">€12/mese</div>
+          </div>
+        </div>
+        <button onclick="closeSheet('subUpgradeModal')" style="width:100%;padding:12px;border:1px solid var(--bd);border-radius:12px;background:transparent;color:var(--t2);font-family:'Sora',sans-serif;font-size:.85rem;font-weight:600;cursor:pointer">Non adesso</button>
+      </div>`;
+  }
+  closeProfilePanel();
+  setTimeout(()=>openSheet('subUpgradeModal'),200);
+}
+
+function openEditModal(){
+  const p=window.ParkAuth?.profile||G?.prof;
+  const u=window.ParkAuth?.user||G?.user;
+  const nm=p?.name||u?.displayName||'';
+  const el=document.getElementById('editNameIn');
+  if(el)el.value=nm;
+  closeProfilePanel();
+  setTimeout(()=>openSheet('editNameModal'),200);
+}
+
+function openVehicleEditModal(){
+  const p=window.ParkAuth?.profile||G?.prof;
+  const tEl=document.getElementById('editVehTarga');
+  const mEl=document.getElementById('editVehModel');
+  if(tEl)tEl.value=p?.vehicle?.targa||'';
+  if(mEl)mEl.value=p?.vehicle?.model||p?.vehicle?.modello||'';
+  closeProfilePanel();
+  setTimeout(()=>openSheet('editVehModal'),200);
+}
+
+async function saveNameProf(){
+  const nm=document.getElementById('editNameIn')?.value?.trim();
+  if(!nm){showT('⚠️ Inserisci un nome');return;}
+  const btn=document.getElementById('btnSaveName');
+  if(btn){btn._o=btn.textContent;btn.textContent='⏳';btn.disabled=true;}
+  try{
+    const u=window.ParkAuth?.auth?.currentUser||auth?.currentUser;
+    if(u){
+      await updateProfile(u,{displayName:nm});
+      const db2=window.ParkAuth?.db||db;
+      if(db2)await updateDoc(doc(db2,'users',u.uid),{name:nm});
+    }
+    if(G?.prof)G.prof.name=nm;
+    if(window.ParkAuth?.profile)window.ParkAuth.profile.name=nm;
+    closeSheet('editNameModal');
+    showT('✅ Profilo aggiornato');
+    setTimeout(openProfilePanel,300);
+  }catch(e){showT('❌ '+e.message);}
+  finally{if(btn){btn.textContent=btn._o;btn.disabled=false;}}
+}
+
+async function saveVehProf(){
+  const targa=document.getElementById('editVehTarga')?.value?.trim().toUpperCase();
+  const model=document.getElementById('editVehModel')?.value?.trim();
+  if(!targa){showT('⚠️ Inserisci la targa');return;}
+  const btn=document.getElementById('btnSaveVeh');
+  if(btn){btn._o=btn.textContent;btn.textContent='⏳';btn.disabled=true;}
+  try{
+    const u=window.ParkAuth?.auth?.currentUser||auth?.currentUser;
+    if(u){
+      const db2=window.ParkAuth?.db||db;
+      if(db2)await updateDoc(doc(db2,'users',u.uid),{vehicle:{targa,model}});
+    }
+    const veh={targa,model};
+    if(G?.prof)G.prof.vehicle=veh;
+    if(window.ParkAuth?.profile)window.ParkAuth.profile.vehicle=veh;
+    closeSheet('editVehModal');
+    showT('✅ Veicolo salvato');
+    setTimeout(openProfilePanel,300);
+  }catch(e){showT('❌ '+e.message);}
+  finally{if(btn){btn.textContent=btn._o;btn.disabled=false;}}
+}
+
+function doLogoutConfirm(){
+  closeProfilePanel();
+  setTimeout(()=>{
+    if(confirm('Vuoi uscire dall\'account?')){
+      if(window.ParkAuth?.auth)window.ParkAuth.auth.signOut();
+      else if(typeof signOut!=='undefined')signOut(auth);
+      showT('👋 A presto!');
+    }
+  },300);
+}
+
+// Override setNav to handle profilo tab
+const _origSetNav=typeof setNav==='function'?setNav:null;
+function setNav(el,tab){
+  document.querySelectorAll('.ni').forEach(i=>i.classList.remove('on'));
+  if(el)el.classList.add('on');
+}
+
+// Update nav avatar when auth state changes
+function syncNavAvatar(){
+  const u=window.ParkAuth?.user||G?.user;
+  const p=window.ParkAuth?.profile||G?.prof;
+  updateNavAvatar(u,p);
+}
+
+// Poll for auth updates
+setInterval(syncNavAvatar, 2000);
+
+
+
+// ══════════════════════════════════════════════════════════
+//  ONBOARDING + UPSELL + PLANS
+// ══════════════════════════════════════════════════════════
+
+function showOnboarding(){
+  const ov=document.getElementById('onboardingOverlay');
+  const sh=document.getElementById('onboardingSheet');
+  if(!ov||!sh)return;
+  ov.style.display='flex';
+  document.body.style.overflow='hidden';
+  requestAnimationFrame(()=>{
+    ov.style.opacity='1';
+    sh.style.transform='translateY(0)';
+    sh.style.transitionTimingFunction='cubic-bezier(.33,1,.68,1)';
+  });
+}
+
+function closeOnboarding(){
+  const ov=document.getElementById('onboardingOverlay');
+  const sh=document.getElementById('onboardingSheet');
+  if(!ov||!sh)return;
+  ov.style.opacity='0';
+  sh.style.transform='translateY(100%)';
+  sh.style.transitionTimingFunction='cubic-bezier(.32,0,.67,0)';
+  setTimeout(()=>{ov.style.display='none';document.body.style.overflow='';},320);
+  localStorage.setItem('pk_onboarded','1');
+}
+
+function showPlansModal(){
+  openSheet('plansModal');
+}
+
+// Show upsell after booking (only for free users, max once per session)
+let upsellShownThisSession=false;
+function maybeShowUpsell(){
+  if(upsellShownThisSession)return;
+  const plan=(window.ParkAuth?.profile||G?.prof)?.plan||'free';
+  if(plan!=='free')return;
+  upsellShownThisSession=true;
+  setTimeout(()=>openSheet('upsellSheet'),800);
+}
+
+// Check first launch
+function checkFirstLaunch(){
+  if(!localStorage.getItem('pk_onboarded')){
+    setTimeout(showOnboarding,1200);
+  }
+}
+
+// Floating upgrade banner in profile for free users
+function maybeShowUpgradeBanner(){
+  const plan=(window.ParkAuth?.profile||G?.prof)?.plan||'free';
+  const banner=document.getElementById('upgradeBanner');
+  if(banner) banner.style.display=(plan==='free'?'flex':'none');
+}
+
+// Override confirmBook to also trigger upsell
+const _origConfirmBook = typeof confirmBook==='function' ? confirmBook : null;
+window._origConfirmBook = _origConfirmBook;
+
+
+// ══════════════════════════════════════════════════════════
+//  PWA — Service Worker + Install Prompt
+// ══════════════════════════════════════════════════════════
+
+// Registra il Service Worker
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js')
+      .then(reg => {
+        console.log('[PWA] Service Worker registrato:', reg.scope);
+
+        // Controlla aggiornamenti ogni ora
+        setInterval(() => reg.update(), 60 * 60 * 1000);
+
+        // Notifica quando c'è un aggiornamento disponibile
+        reg.addEventListener('updatefound', () => {
+          const newSW = reg.installing;
+          newSW.addEventListener('statechange', () => {
+            if (newSW.state === 'installed' && navigator.serviceWorker.controller) {
+              showInstallToast('🔄 Aggiornamento disponibile — ricarica per applicarlo', true);
+            }
+          });
+        });
+      })
+      .catch(err => console.warn('[PWA] Service Worker non registrato:', err));
+  });
+}
+
+// ── INSTALL PROMPT ─────────────────────────────────────────
+let deferredInstallPrompt = null;
+
+// Cattura il prompt di installazione del browser
+window.addEventListener('beforeinstallprompt', e => {
+  e.preventDefault();
+  deferredInstallPrompt = e;
+  // Mostra il banner di installazione dopo 30 secondi
+  setTimeout(showInstallBanner, 30000);
+});
+
+// Mostra banner "Aggiungi alla schermata Home"
+function showInstallBanner() {
+  if (!deferredInstallPrompt) return;
+  if (localStorage.getItem('pk_install_dismissed')) return;
+
+  const banner = document.createElement('div');
+  banner.id = 'installBanner';
+  banner.innerHTML = `
+    <div style="position:fixed;bottom:calc(70px + env(safe-area-inset-bottom));left:14px;right:14px;
+                background:#13131b;border:1px solid rgba(0,201,107,.25);border-radius:14px;
+                padding:13px 15px;z-index:9000;display:flex;align-items:center;gap:12px;
+                box-shadow:0 8px 32px rgba(0,0,0,.5);animation:fadeUp .4s ease both">
+      <div style="width:36px;height:36px;border-radius:10px;background:linear-gradient(135deg,#0a2e1a,#00c96b);
+                  display:flex;align-items:center;justify-content:center;font-size:1.1rem;flex-shrink:0">🅿️</div>
+      <div style="flex:1">
+        <div style="font-size:.82rem;font-weight:700;color:#f0f0fa;margin-bottom:1px">Installa ParkEasy</div>
+        <div style="font-size:.7rem;color:#7070a0">Aggiungila alla schermata Home per accedervi subito</div>
+      </div>
+      <button onclick="installApp()" style="background:#00c96b;color:#000;border:none;border-radius:9px;
+              padding:8px 12px;font-family:'Sora',sans-serif;font-size:.77rem;font-weight:800;
+              cursor:pointer;white-space:nowrap">Installa</button>
+      <button onclick="dismissInstall()" style="background:none;border:none;color:#40405a;
+              font-size:1.2rem;cursor:pointer;padding:0;line-height:1;flex-shrink:0">×</button>
+    </div>`;
+  document.body.appendChild(banner);
+}
+
+async function installApp() {
+  if (!deferredInstallPrompt) return;
+  deferredInstallPrompt.prompt();
+  const { outcome } = await deferredInstallPrompt.userChoice;
+  console.log('[PWA] Install outcome:', outcome);
+  deferredInstallPrompt = null;
+  document.getElementById('installBanner')?.remove();
+  if (outcome === 'accepted') {
+    showT('✅ ParkEasy installata!');
+    localStorage.setItem('pk_install_dismissed', '1');
+  }
+}
+
+function dismissInstall() {
+  document.getElementById('installBanner')?.remove();
+  localStorage.setItem('pk_install_dismissed', '1');
+}
+
+// Quando l'app viene installata
+window.addEventListener('appinstalled', () => {
+  console.log('[PWA] App installata!');
+  showT('🎉 ParkEasy aggiunta alla schermata Home!');
+  deferredInstallPrompt = null;
+});
+
+// Rileva se sta girando come PWA installata
+const isStandalone = window.matchMedia('(display-mode: standalone)').matches
+                  || window.navigator.standalone
+                  || document.referrer.includes('android-app://');
+
+if (isStandalone) {
+  console.log('[PWA] Avviata in modalità standalone (installata)');
+  document.documentElement.classList.add('pwa-standalone');
+}
+
+// Gestisci deep link da shortcut (es. ?action=segnala)
+const urlParams = new URLSearchParams(window.location.search);
+const action = urlParams.get('action');
+if (action) {
+  window.addEventListener('load', () => {
+    setTimeout(() => {
+      if (action === 'segnala') openCrowdFlow?.();
+      if (action === 'prenota') openBookDefault?.();
+      if (action === 'profilo') openProfilePanel?.();
+    }, 1500);
+  });
+}
+
+function showInstallToast(msg, withAction = false) {
+  const t = document.getElementById('toast');
+  if (!t) return;
+  if (withAction) {
+    t.innerHTML = msg + `<button onclick="location.reload()" style="margin-left:10px;background:var(--green);color:#000;border:none;border-radius:7px;padding:4px 10px;font-family:'Sora',sans-serif;font-size:.75rem;font-weight:700;cursor:pointer">Ricarica</button><div class="toast-progress"></div>`;
+  } else {
+    t.innerHTML = msg + '<div class="toast-progress"></div>';
+  }
+  t.classList.add('show');
+  clearTimeout(t._t);
+  t._t = setTimeout(() => t.classList.remove('show'), 5000);
+}
+
+</script>
+</body>
+</html>
